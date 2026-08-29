@@ -4,10 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 	"os/signal"
 	"syscall"
-	"unsafe"
 )
 
 func main() {
@@ -37,44 +35,18 @@ func main() {
 				if err != nil {
 					return
 				}
+				fmt.Printf("========\n")
 				fmt.Printf("received %d bytes: %  x\n", n, buf[:n])
 				// IPv4: 1=ICMP, 6=TCP, 17=UDP
 				fmt.Printf("proto=%d\n", buf[9])
+				hdr, err := ParseIPv4Header(buf)
+				if err != nil {
+					return
+				}
+				fmt.Printf("Protocol: %v, Src: %v, Dst: %v\n", hdr.Protocol, hdr.Src, hdr.Dst)
 			}
 		}
 	}()
 
 	<-ctx.Done()
-}
-
-const (
-	IFF_TUN   = 0x0001 // EthernetではなくIPパケットを扱う
-	IFF_NO_PI = 0x1000 // 4byteのメタデータのPIを先頭に付けない
-	TUNSETIFF = 0x400454ca
-)
-
-type ifreq struct {
-	Name  [16]byte
-	Flags uint16
-	_     [22]byte
-}
-
-func createTUN(name string) (*os.File, error) {
-	f, err := os.OpenFile("/dev/net/tun", os.O_RDWR, 0)
-	if err != nil {
-		return nil, err
-	}
-	var req ifreq
-
-	copy(req.Name[:], name)
-	req.Flags = IFF_TUN | IFF_NO_PI
-
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(TUNSETIFF), uintptr(unsafe.Pointer(&req)))
-
-	if errno != 0 {
-		f.Close()
-		return nil, errno
-	}
-
-	return f, nil
 }
