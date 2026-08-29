@@ -23,8 +23,24 @@ func ParseIPv4Header(buf []byte) (IPv4Header, error) {
 	var hdr IPv4Header
 
 	hdr.Version = buf[0] >> 4
+	if hdr.Version != 4 {
+		return IPv4Header{}, fmt.Errorf("not an IPv4 packet: version=%d", hdr.Version)
+	}
+	
 	hdr.IHL = buf[0] & 0x0f
+	if hdr.IHL < 5 {
+		return IPv4Header{}, fmt.Errorf("invalid IHL: %d", hdr.IHL)
+	}
+	headerLen := int(hdr.IHL) * 4
+	if len(buf) < headerLen {
+		return IPv4Header{}, fmt.Errorf("packet too short for IHL: %d bytes, need %d", len(buf), headerLen)
+	}
+
 	hdr.TotalLen = binary.BigEndian.Uint16(buf[2:4])
+	if int(hdr.TotalLen) > len(buf) {
+    return IPv4Header{}, fmt.Errorf("total length %d exceeds buffer size %d", hdr.TotalLen, len(buf))
+	}
+
 	hdr.Protocol = buf[9]
 	hdr.Src = netip.AddrFrom4([4]byte(buf[12:16]))
 	hdr.Dst = netip.AddrFrom4([4]byte(buf[16:20]))

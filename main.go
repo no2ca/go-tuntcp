@@ -25,6 +25,7 @@ func main() {
 	fmt.Printf("created tun interface: %s\n", name)
 
 	go func() {
+		defer fmt.Printf("Reading packets done. Waiting for an interrupt...")
 		buf := make([]byte, 1500)
 		for {
 			select {
@@ -33,16 +34,18 @@ func main() {
 			default:
 				n, err := tun.Read(buf)
 				if err != nil {
+					log.Print(err)
 					return
 				}
+
 				fmt.Printf("========\n")
 				fmt.Printf("received %d bytes: %  x\n", n, buf[:n])
-				// IPv4: 1=ICMP, 6=TCP, 17=UDP
-				fmt.Printf("proto=%d\n", buf[9])
+
 				hdr, err := ParseIPv4Header(buf)
 				if err != nil {
-					return
+					log.Print(err)
 				}
+				// IPv4: 1=ICMP, 6=TCP, 17=UDP
 				fmt.Printf("Protocol: %v, Src: %v, Dst: %v\n", hdr.Protocol, hdr.Src, hdr.Dst)
 			}
 		}
