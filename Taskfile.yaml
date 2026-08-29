@@ -13,7 +13,14 @@ tasks:
   ping:
     cmds:
       - ping {{.TUN_PEER_IP}}
+  curl:
+    cmds:
+      - curl {{.TUN_PEER_IP}}
   ping-test:
     cmds:
       - task setup-interface
       - task ping
+  curl-test:
+    cmds:
+      - task setup-interface
+      - task curl
