@@ -11,6 +11,7 @@ type IPv4Header struct {
 	IHL      uint8
 	TotalLen uint16
 	Protocol uint8
+	Checksum uint16
 	Src      netip.Addr
 	Dst      netip.Addr
 }
@@ -42,8 +43,32 @@ func ParseIPv4Header(buf []byte) (IPv4Header, error) {
 	}
 
 	hdr.Protocol = buf[9]
+	hdr.Checksum = binary.BigEndian.Uint16(buf[10:12])
 	hdr.Src = netip.AddrFrom4([4]byte(buf[12:16]))
 	hdr.Dst = netip.AddrFrom4([4]byte(buf[16:20]))
+	
+	if calculateChecksum(buf[:headerLen]) != 0 {
+		return IPv4Header{}, fmt.Errorf("checksum mismatch")
+	}
 
 	return hdr, nil
+}
+
+// calculateChecksum computes the IPv4 header checksum (RFC 791).
+func calculateChecksum(buf []byte) uint16 {
+	var sum uint32
+	
+	for i := 0; i+1 < len(buf); i += 2 {
+		sum += uint32(binary.BigEndian.Uint16((buf[i : i+2])))
+	}
+
+	if len(buf)%2 == 1 {
+		sum += uint32(buf[len(buf)-1]) << 8
+	}
+	
+	for sum > 0xffff {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	
+	return ^uint16(sum)
 }
