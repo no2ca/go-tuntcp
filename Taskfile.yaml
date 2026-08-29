@@ -1,0 +1,19 @@
+version: '3'
+
+vars:
+  TUN_NAME: tun0
+  TUN_IP: 10.10.0.1
+  TUN_PEER_IP: 10.10.0.2
+
+tasks:
+  setup-interface:
+    cmds:
+      - ip addr add {{.TUN_IP}} peer {{.TUN_PEER_IP}} dev {{.TUN_NAME}}
+      - ip link set tun0 up
+  ping:
+    cmds:
+      - ping {{.TUN_PEER_IP}}
+  ping-test:
+    cmds:
+      - task setup-interface
+      - task ping
