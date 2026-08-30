@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -61,25 +62,83 @@ func readLoop(ctx context.Context, ch chan readResult, tun io.Reader) {
 	}
 }
 
+const (
+	PROTO_ICMP = 1
+	PROTO_TCP  = 6
+	PROTO_UDP  = 17
+)
+
 func displayPacket(res readResult) {
 	fmt.Printf("========\n")
 	fmt.Printf("received %d bytes: %  x\n", res.n, res.buf[:res.n])
 
-	hdr, err := ParseIPv4Header(res.buf)
+	ipv4hdr, payload, err := ParseIPv4Header(res.buf)
 	if err != nil {
 		log.Print(err)
 	}
-	// IPv4: 1=ICMP, 6=TCP, 17=UDP
+
 	var proto string
-	switch hdr.Protocol {
-	case 1:
+	switch ipv4hdr.Protocol {
+	case PROTO_ICMP:
 		proto = "ICMP"
-	case 6:
+	case PROTO_TCP:
 		proto = "TCP"
-	case 17:
+	case PROTO_UDP:
 		proto = "UDP"
 	default:
 		proto = "other"
 	}
-	fmt.Printf("Protocol: %v (%s), Src: %v, Dst: %v\n", hdr.Protocol, proto, hdr.Src, hdr.Dst)
+	fmt.Printf("Protocol: %v (%s), Src: %v, Dst: %v\n", ipv4hdr.Protocol, proto, ipv4hdr.Src, ipv4hdr.Dst)
+
+	if ipv4hdr.Protocol == PROTO_TCP {
+		hdr, err := ParseTCPHeader(payload)
+		if err != nil {
+			log.Print(err)
+		}
+		fmt.Printf("SrcPort: %v, DstPort: %v, Seq: %v, Ack: %v\n", hdr.SrcPort, hdr.DstPort, hdr.Seq, hdr.Ack)
+		fmt.Printf("DataOffset: %v, Flags: %v\n", hdr.DataOffset, hdr.Flags)
+	}
+}
+
+// https://datatracker.ietf.org/doc/html/rfc9293#name-header-format
+type TCPHeader struct {
+	SrcPort    uint16
+	DstPort    uint16
+	Seq        uint32
+	Ack        uint32
+	DataOffset uint8
+
+	Flags  uint8
+	Window uint16
+
+	Checksum uint16
+	Urgent   uint16
+}
+
+func ParseTCPHeader(data []byte) (TCPHeader, error) {
+	if len(data) < 20 {
+		return TCPHeader{}, fmt.Errorf("[TCP] packet too short: %d bytes", len(data))
+	}
+
+	var hdr TCPHeader
+
+	hdr.SrcPort = binary.BigEndian.Uint16(data[0:2])
+	hdr.DstPort = binary.BigEndian.Uint16(data[2:4])
+	hdr.Seq = binary.BigEndian.Uint32(data[4:8])
+	hdr.Ack = binary.BigEndian.Uint32(data[8:12])
+	hdr.DataOffset = (data[12] >> 4) * 4
+	hdr.Flags = data[13]
+	hdr.Window = binary.BigEndian.Uint16(data[14:16])
+	hdr.Checksum = binary.BigEndian.Uint16(data[16:18])
+	hdr.Urgent = binary.BigEndian.Uint16(data[18:20])
+
+	headerLen := int(hdr.DataOffset)
+	if headerLen < 20 {
+		return TCPHeader{}, fmt.Errorf("[TCP] invalid data offset: %d", headerLen)
+	}
+	if len(data) < headerLen {
+		return TCPHeader{}, fmt.Errorf("[TCP] packet too short for data offset: %d bytes, need %d", len(data), headerLen)
+	}
+
+	return hdr, nil
 }
