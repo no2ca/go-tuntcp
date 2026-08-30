@@ -11,7 +11,7 @@
 - IPv4 headerのparse / serialize
 - checksum計算
 
-- [ ] 3. TCP packet
+- [x] 3. TCP packet
 - TCP headerのparse / serialize
 - flags / options / checksum
 
