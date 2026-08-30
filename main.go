@@ -95,6 +95,6 @@ func displayPacket(res readResult) {
 			log.Print(err)
 		}
 		fmt.Printf("SrcPort: %v, DstPort: %v, Seq: %v, Ack: %v\n", hdr.SrcPort, hdr.DstPort, hdr.Seq, hdr.Ack)
-		fmt.Printf("DataOffset: %v, Flags: %v\n", hdr.DataOffset, hdr.Flags)
+		fmt.Printf("DataOffset: %v, Flags: %v (%v)\n", hdr.DataOffset, hdr.Flags, hdr.StringFlags())
 	}
 }
