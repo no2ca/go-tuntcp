@@ -67,24 +67,31 @@ func (h *TCPHeader) HasFlag(flag Flag) bool {
 	return h.Flags&flag != 0
 }
 
-var flagNames = map[Flag]string{
-	FlagFIN: "FIN",
-	FlagSYN: "SYN",
-	FlagRST: "RST",
-	FlagPSH: "PSH",
-	FlagACK: "ACK",
-	FlagURG: "URG",
+var flagNames = []struct {
+	flag Flag
+	name string
+}{
+	{FlagURG, "URG"},
+	{FlagACK, "ACK"},
+	{FlagPSH, "PSH"},
+	{FlagRST, "RST"},
+	{FlagSYN, "SYN"},
+	{FlagFIN, "FIN"},
 }
 
 func (h *TCPHeader) StringFlags() string {
 	var names []string
-	for flag, name := range flagNames {
-		if h.HasFlag(flag) {
-			names = append(names, name)
+	for _, f := range flagNames {
+		if h.HasFlag(f.flag) {
+			names = append(names, f.name)
 		}
 	}
 	if names == nil {
 		return "None"
 	}
 	return strings.Join(names, " | ")
+}
+
+func VerifyTCPChecksum(IPv4Header, segment []byte) {
+
 }
