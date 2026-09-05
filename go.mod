@@ -1,3 +1,3 @@
-module go-user-tcp
+module go-tuntcp
 
 go 1.26.7
