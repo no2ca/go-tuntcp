@@ -47,12 +47,17 @@ func ParseIPv4Header(buf []byte) (IPv4Header, []byte, error) {
 	hdr.Src = netip.AddrFrom4([4]byte(buf[12:16]))
 	hdr.Dst = netip.AddrFrom4([4]byte(buf[16:20]))
 
-	if calculateIPv4Checksum(buf[:headerLen]) != 0 {
+	if !VerifyIPv4Checksum(buf[:headerLen]) {
 		return IPv4Header{}, nil, fmt.Errorf("checksum mismatch")
 	}
 
 	payload := buf[headerLen:hdr.TotalLen]
 	return hdr, payload, nil
+}
+
+// VerifyIPv4Checksum reports whether the header carries a valid checksum.
+func VerifyIPv4Checksum(buf []byte) bool {
+	return calculateIPv4Checksum(buf) == 0
 }
 
 // calculateIPv4Checksum computes the IPv4 header checksum (RFC 791).

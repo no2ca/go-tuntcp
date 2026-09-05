@@ -26,7 +26,7 @@ func ParseTCPHeader(ipSrc, ipDst [4]byte, seg []byte) (TCPHeader, []byte, []byte
 		return TCPHeader{}, nil, nil, fmt.Errorf("[TCP] packet too short: %d bytes", len(seg))
 	}
 
-	if calculateTCPChecksum(ipSrc, ipDst, seg) != 0 {
+	if !VerifyTCPChecksum(ipSrc, ipDst, seg) {
 		return TCPHeader{}, nil, nil, fmt.Errorf("checksum mismatch")
 	}
 
@@ -56,6 +56,14 @@ func ParseTCPHeader(ipSrc, ipDst [4]byte, seg []byte) (TCPHeader, []byte, []byte
 	return hdr, options, payload, nil
 }
 
+// VerifyTCPChecksum reports whether seg carries a valid checksum for the
+// given source and destination addresses.
+func VerifyTCPChecksum(src, dst [4]byte, tcp []byte) bool {
+	return calculateTCPChecksum(src, dst, tcp) == 0
+}
+
+// calculateTCPChecksum computes the TCP checksum over the IPv4 pseudo header
+// and the segment (RFC 9293).
 func calculateTCPChecksum(src, dst [4]byte, tcp []byte) uint16 {
 	pseudo := make([]byte, 12)
 	copy(pseudo[0:4], src[:])
