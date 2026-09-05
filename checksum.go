@@ -12,7 +12,7 @@ func Sum(buf []byte) uint32 {
 	if len(buf)%2 == 1 {
 		sum += uint32(buf[len(buf)-1]) << 8
 	}
-	
+
 	return sum
 }
 

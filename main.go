@@ -71,9 +71,10 @@ func displayPacket(res readResult) {
 	fmt.Printf("========\n")
 	fmt.Printf("received %d bytes: %  x\n", res.n, res.buf[:res.n])
 
-	ipv4hdr, payload, err := ParseIPv4Header(res.buf)
+	ipv4hdr, payload, err := ParseIPv4Header(res.buf[:res.n])
 	if err != nil {
 		log.Print(err)
+		return
 	}
 
 	var proto string
@@ -93,6 +94,7 @@ func displayPacket(res readResult) {
 		hdr, _, _, err := ParseTCPHeader(ipv4hdr.Src.As4(), ipv4hdr.Dst.As4(), payload)
 		if err != nil {
 			log.Print(err)
+			return
 		}
 		fmt.Printf("SrcPort: %v, DstPort: %v, Seq: %v, Ack: %v\n", hdr.SrcPort, hdr.DstPort, hdr.Seq, hdr.Ack)
 		fmt.Printf("DataOffset: %v, Flags: %v (%v)\n", hdr.DataOffset, hdr.Flags, hdr.StringFlags())
