@@ -21,35 +21,50 @@ type TCPHeader struct {
 	Urgent   uint16
 }
 
-func ParseTCPHeader(data []byte) (TCPHeader, []byte, []byte, error) {
-	if len(data) < 20 {
-		return TCPHeader{}, nil, nil, fmt.Errorf("[TCP] packet too short: %d bytes", len(data))
+func ParseTCPHeader(ipSrc, ipDst [4]byte, seg []byte) (TCPHeader, []byte, []byte, error) {
+	if len(seg) < 20 {
+		return TCPHeader{}, nil, nil, fmt.Errorf("[TCP] packet too short: %d bytes", len(seg))
+	}
+
+	if calculateTCPChecksum(ipSrc, ipDst, seg) != 0 {
+		return TCPHeader{}, nil, nil, fmt.Errorf("checksum mismatch")
 	}
 
 	var hdr TCPHeader
 
-	hdr.SrcPort = binary.BigEndian.Uint16(data[0:2])
-	hdr.DstPort = binary.BigEndian.Uint16(data[2:4])
-	hdr.Seq = binary.BigEndian.Uint32(data[4:8])
-	hdr.Ack = binary.BigEndian.Uint32(data[8:12])
-	hdr.DataOffset = (data[12] >> 4) * 4
-	hdr.Flags = Flag(data[13])
-	hdr.Window = binary.BigEndian.Uint16(data[14:16])
-	hdr.Checksum = binary.BigEndian.Uint16(data[16:18])
-	hdr.Urgent = binary.BigEndian.Uint16(data[18:20])
+	hdr.SrcPort = binary.BigEndian.Uint16(seg[0:2])
+	hdr.DstPort = binary.BigEndian.Uint16(seg[2:4])
+	hdr.Seq = binary.BigEndian.Uint32(seg[4:8])
+	hdr.Ack = binary.BigEndian.Uint32(seg[8:12])
+	hdr.DataOffset = (seg[12] >> 4) * 4
+	hdr.Flags = Flag(seg[13])
+	hdr.Window = binary.BigEndian.Uint16(seg[14:16])
+	hdr.Checksum = binary.BigEndian.Uint16(seg[16:18])
+	hdr.Urgent = binary.BigEndian.Uint16(seg[18:20])
 
 	headerLen := int(hdr.DataOffset)
 	if headerLen < 20 {
 		return TCPHeader{}, nil, nil, fmt.Errorf("[TCP] invalid data offset: %d", headerLen)
 	}
-	if len(data) < headerLen {
-		return TCPHeader{}, nil, nil, fmt.Errorf("[TCP] packet too short for data offset: %d bytes, need %d", len(data), headerLen)
+	if len(seg) < headerLen {
+		return TCPHeader{}, nil, nil, fmt.Errorf("[TCP] packet too short for data offset: %d bytes, need %d", len(seg), headerLen)
 	}
 
-	options := data[20:headerLen]
-	payload := data[headerLen:]
+	options := seg[20:headerLen]
+	payload := seg[headerLen:]
 
 	return hdr, options, payload, nil
+}
+
+func calculateTCPChecksum(src, dst [4]byte, tcp []byte) uint16 {
+	pseudo := make([]byte, 12)
+	copy(pseudo[0:4], src[:])
+	copy(pseudo[4:8], dst[:])
+	pseudo[8] = 0
+	pseudo[9] = PROTO_TCP
+	binary.BigEndian.PutUint16(pseudo[10:12], uint16(len(tcp)))
+
+	return Fold(Sum(pseudo) + Sum(tcp))
 }
 
 type Flag uint8
@@ -90,8 +105,4 @@ func (h *TCPHeader) StringFlags() string {
 		return "None"
 	}
 	return strings.Join(names, " | ")
-}
-
-func VerifyTCPChecksum(IPv4Header, segment []byte) {
-
 }

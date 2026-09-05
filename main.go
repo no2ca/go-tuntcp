@@ -90,7 +90,7 @@ func displayPacket(res readResult) {
 	fmt.Printf("Protocol: %v (%s), Src: %v, Dst: %v\n", ipv4hdr.Protocol, proto, ipv4hdr.Src, ipv4hdr.Dst)
 
 	if ipv4hdr.Protocol == PROTO_TCP {
-		hdr, _, _, err := ParseTCPHeader(payload)
+		hdr, _, _, err := ParseTCPHeader(ipv4hdr.Src.As4(), ipv4hdr.Dst.As4(), payload)
 		if err != nil {
 			log.Print(err)
 		}
