@@ -16,6 +16,21 @@ type IPv4Header struct {
 	Dst      netip.Addr
 }
 
+func (hdr IPv4Header) StringProtocol() string {
+	var proto string
+	switch hdr.Protocol {
+	case PROTO_ICMP:
+		proto = "ICMP"
+	case PROTO_TCP:
+		proto = "TCP"
+	case PROTO_UDP:
+		proto = "UDP"
+	default:
+		proto = "other"
+	}
+	return proto
+}
+
 func ParseIPv4Header(buf []byte) (IPv4Header, []byte, error) {
 	if len(buf) < 20 {
 		return IPv4Header{}, nil, fmt.Errorf("[IPv4] packet too short: %d bytes", len(buf))

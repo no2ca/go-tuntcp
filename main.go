@@ -77,18 +77,7 @@ func displayPacket(res readResult) {
 		return
 	}
 
-	var proto string
-	switch ipv4hdr.Protocol {
-	case PROTO_ICMP:
-		proto = "ICMP"
-	case PROTO_TCP:
-		proto = "TCP"
-	case PROTO_UDP:
-		proto = "UDP"
-	default:
-		proto = "other"
-	}
-	fmt.Printf("Protocol: %v (%s), Src: %v, Dst: %v\n", ipv4hdr.Protocol, proto, ipv4hdr.Src, ipv4hdr.Dst)
+	fmt.Printf("Protocol: %v (%s), Src: %v, Dst: %v\n", ipv4hdr.Protocol, ipv4hdr.StringProtocol(), ipv4hdr.Src, ipv4hdr.Dst)
 
 	if ipv4hdr.Protocol == PROTO_TCP {
 		hdr, _, _, err := ParseTCPHeader(ipv4hdr.Src.As4(), ipv4hdr.Dst.As4(), payload)
