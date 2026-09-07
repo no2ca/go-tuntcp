@@ -6,6 +6,17 @@ import (
 	"strings"
 )
 
+type Flag uint8
+
+const (
+	FlagFIN Flag = 1 << 0
+	FlagSYN Flag = 1 << 1
+	FlagRST Flag = 1 << 2
+	FlagPSH Flag = 1 << 3
+	FlagACK Flag = 1 << 4
+	FlagURG Flag = 1 << 5
+)
+
 // https://datatracker.ietf.org/doc/html/rfc9293#name-header-format
 type TCPHeader struct {
 	SrcPort    uint16
@@ -75,17 +86,6 @@ func calculateTCPChecksum(src, dst [4]byte, tcp []byte) uint16 {
 	return Fold(Sum(pseudo) + Sum(tcp))
 }
 
-type Flag uint8
-
-const (
-	FlagFIN Flag = 1 << 0
-	FlagSYN Flag = 1 << 1
-	FlagRST Flag = 1 << 2
-	FlagPSH Flag = 1 << 3
-	FlagACK Flag = 1 << 4
-	FlagURG Flag = 1 << 5
-)
-
 func (h *TCPHeader) HasFlag(flag Flag) bool {
 	return h.Flags&flag != 0
 }
@@ -113,4 +113,32 @@ func (h *TCPHeader) StringFlags() string {
 		return "None"
 	}
 	return strings.Join(names, " | ")
+}
+
+// https://datatracker.ietf.org/doc/html/rfc9293#section-3.3.2
+type State int
+
+const (
+	StateClosed State = iota
+	StateListen
+	StateSynSent
+	StateSynReceived
+	StateEstablished
+)
+
+func (s State) String() string {
+	switch s {
+	case StateClosed:
+		return "Closed"
+	case StateListen:
+		return "Listen"
+	case StateSynSent:
+		return "SynSent"
+	case StateSynReceived:
+		return "SynReceived"
+	case StateEstablished:
+		return "Established"
+	default:
+		return ""
+	}
 }
