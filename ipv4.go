@@ -46,6 +46,8 @@ func (h IPv4Header) Serialize(payload []byte) []byte {
 	buf[8] = h.TTL
 	// Protocol
 	buf[9] = h.Protocol
+	// Checksum
+	binary.BigEndian.PutUint16(buf[10:12], 0)
 	// Source Address
 	src := h.Src.As4()
 	copy(buf[12:16], src[:])
@@ -53,7 +55,7 @@ func (h IPv4Header) Serialize(payload []byte) []byte {
 	dst := h.Dst.As4()
 	copy(buf[16:20], dst[:])
 
-	// Checksum
+	// Write Checksum
 	checksum := calculateIPv4Checksum(buf[:20])
 	binary.BigEndian.PutUint16(buf[10:12], checksum)
 
