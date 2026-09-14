@@ -115,33 +115,18 @@ func (h *TCPHeader) StringFlags() string {
 	return strings.Join(names, " | ")
 }
 
+//go:generate stringer -type=State -linecomment
+
 // https://datatracker.ietf.org/doc/html/rfc9293#section-3.3.2
 type State int
 
 const (
-	StateClosed State = iota
-	StateListen
-	StateSynSent
-	StateSynReceived
-	StateEstablished
+	StateClosed      State = iota // CLOSED
+	StateListen                   // LISTEN
+	StateSynSent                  // SYN-SENT
+	StateSynReceived              // SYN-RECEIVED
+	StateEstablished              // ESTABLISHED
 )
-
-func (s State) String() string {
-	switch s {
-	case StateClosed:
-		return "Closed"
-	case StateListen:
-		return "Listen"
-	case StateSynSent:
-		return "SynSent"
-	case StateSynReceived:
-		return "SynReceived"
-	case StateEstablished:
-		return "Established"
-	default:
-		return ""
-	}
-}
 
 // SendSequenceSpace は RFC 9293 3.3.1 の Send Sequence Variables
 type SendSequenceSpace struct {
