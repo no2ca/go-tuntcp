@@ -1,12 +1,13 @@
 package stack
 
 import (
+	"fmt"
 	"go-tuntcp/internal/ipv4"
 	"go-tuntcp/internal/tcp"
 )
 
 // RFC 9293 3.10.7.1 (CLOSED STATE)
-func buildRST(ip ipv4.Header, t tcp.Header, payloadLen int) []byte {
+func BuildRST(ip ipv4.Header, t tcp.Header, payloadLen int) []byte {
 	if t.HasFlag(tcp.FlagRST) {
 		return nil
 	}
@@ -47,5 +48,14 @@ func buildRST(ip ipv4.Header, t tcp.Header, payloadLen int) []byte {
 		Dst:      ip.Src,
 	}
 
-	return ipHdr.Serialize(payload)
+	packet := ipHdr.Serialize(payload)
+
+	fmt.Printf("========\n")
+	fmt.Printf("created %d bytes: %  x\n", len(packet), packet)
+	fmt.Printf("Protocol: %v (%s), TTL: %v, Src: %v, Dst: %v\n", ipHdr.Protocol, ipHdr.StringProtocol(), ipHdr.TTL, ipHdr.Src, ipHdr.Dst)
+
+	fmt.Printf("SrcPort: %v, DstPort: %v, Seq: %v, Ack: %v\n", tcpHdr.SrcPort, tcpHdr.DstPort, tcpHdr.Seq, tcpHdr.Ack)
+	fmt.Printf("DataOffset: %v, Flags: %v (%v)\n", tcpHdr.DataOffset, tcpHdr.Flags, tcpHdr.StringFlags())
+
+	return packet
 }

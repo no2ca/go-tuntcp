@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"go-tuntcp/internal/ipv4"
+	"go-tuntcp/internal/stack"
 	"go-tuntcp/internal/tcp"
 	"go-tuntcp/internal/tun"
 )
@@ -39,6 +40,8 @@ func main() {
 			return
 		case res := <-ch:
 			displayPacket(res)
+			reply := handlePacket(res)
+			dev.Write(reply)
 		}
 	}
 }
@@ -87,5 +90,23 @@ func displayPacket(res readResult) {
 		}
 		fmt.Printf("SrcPort: %v, DstPort: %v, Seq: %v, Ack: %v\n", hdr.SrcPort, hdr.DstPort, hdr.Seq, hdr.Ack)
 		fmt.Printf("DataOffset: %v, Flags: %v (%v)\n", hdr.DataOffset, hdr.Flags, hdr.StringFlags())
+	}
+}
+
+func handlePacket(res readResult) []byte {
+	ipv4hdr, payload, err := ipv4.Parse(res.buf[:res.n])
+	if err != nil {
+		return nil
+	}
+
+	if ipv4hdr.Protocol == ipv4.ProtoTCP {
+		tcpHdr, _, _, err := tcp.Parse(ipv4hdr.Src.As4(), ipv4hdr.Dst.As4(), payload)
+		if err != nil {
+			log.Print(err)
+			return nil
+		}
+		return stack.BuildRST(ipv4hdr, tcpHdr, res.n)
+	} else {
+		return nil
 	}
 }
