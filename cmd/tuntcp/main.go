@@ -40,7 +40,7 @@ func main() {
 			return
 		case res := <-ch:
 			packet := res.buf[:res.n]
-			displayRaw(packet)
+			displayRawRx(packet)
 
 			ip, ipPayload, err := ipv4.Parse(packet)
 			if err != nil {
@@ -60,13 +60,19 @@ func main() {
 			}
 			displayTCP(t)
 
-			reply := stack.BuildRST(ip, t, len(tcpPayload))
+			ip, t, reply := stack.BuildRST(ip, t, len(tcpPayload))
 			if reply == nil {
 				continue
 			}
+
 			if _, err := dev.Write(reply); err != nil {
 				log.Printf("write: %v", err)
+				continue
 			}
+
+			displayRawTx(reply)
+			displayIPv4(ip)
+			displayTCP(t)
 		}
 	}
 }
@@ -95,9 +101,14 @@ func readLoop(ctx context.Context, ch chan readResult, tun io.Reader) {
 	}
 }
 
-func displayRaw(packet []byte) {
+func displayRawRx(packet []byte) {
 	fmt.Printf("========\n")
 	fmt.Printf("[RECEIVED] %d bytes: %  x\n", len(packet), packet)
+}
+
+func displayRawTx(packet []byte) {
+	fmt.Printf("========\n")
+	fmt.Printf("[SENT] %d bytes: %  x\n", len(packet), packet)
 }
 
 func displayIPv4(ip ipv4.Header) {
