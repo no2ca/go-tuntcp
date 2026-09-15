@@ -1,4 +1,4 @@
-package main
+package tun
 
 import (
 	"os"
@@ -18,7 +18,7 @@ type ifreq struct {
 	_     [22]byte
 }
 
-func createTUN(name string) (*os.File, error) {
+func Create(name string) (*os.File, error) {
 	f, err := os.OpenFile("/dev/net/tun", os.O_RDWR, 0)
 	if err != nil {
 		return nil, err

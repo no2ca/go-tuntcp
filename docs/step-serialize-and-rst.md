@@ -4,7 +4,7 @@
 
 今のコードはパケットを **読んで表示するだけ** の一方通行になっている。
 
-- [ipv4.go](../ipv4.go) / [tcp.go](../tcp.go) にあるのは `Parse*` だけで、バイト列を組み立てる側（serialize）が無い
+- [ipv4.go](../internal/ipv4/ipv4.go) / [tcp.go](../internal/tcp/tcp.go) にあるのは `Parse*` だけで、バイト列を組み立てる側（serialize）が無い
 - TUN に書き戻すコードも無い
 
 マイルストーン 4（state machine）・5（3-way handshake）は「受信に対して返信する」ことが前提なので、
@@ -61,7 +61,7 @@ func (h TCPHeader) Serialize(src, dst [4]byte, payload []byte) []byte
 ### 落とし穴: `DataOffset` の単位
 
 パース時に `hdr.DataOffset = (seg[12] >> 4) * 4` としていて、struct には **バイト数** が入っている
-（[tcp.go:50](../tcp.go#L50)）。書き出すときは 4 で割って上位 4 ビットに戻す:
+（[tcp.go:53](../internal/tcp/tcp.go#L53)）。書き出すときは 4 で割って上位 4 ビットに戻す:
 
 ```go
 seg[12] = (h.DataOffset / 4) << 4
@@ -118,7 +118,7 @@ func handlePacket(res readResult) []byte   // 返信が無ければ nil
 
 ### ついでに直すバグ
 
-[main.go:48-52](../main.go#L48-L52) を見てほしい。`buf` を 1 つ確保して使い回し、
+[main.go:52-56](../cmd/tuntcp/main.go#L52-L56) を見てほしい。`buf` を 1 つ確保して使い回し、
 そのままチャネルに渡している。受信側が `res.buf` を読んでいる最中に、次の `tun.Read(buf)` が
 同じメモリを上書きしうる。
 
@@ -133,7 +133,7 @@ func handlePacket(res readResult) []byte   // 返信が無ければ nil
 
 - `checksum_test.go`: `Sum` の奇数長入力、`Fold` のキャリー畳み込み（`0x1FFFF` → ?）
 - `ipv4_test.go`: 既知のバイト列 → Parse → Serialize で **元のバイト列と完全一致**（round-trip）
-- `tcp_test.go`: 同上 + `Serialize` の出力を `VerifyTCPChecksum` に通して true
+- `tcp_test.go`: 同上 + `Serialize` の出力を `tcp.VerifyChecksum` に通して true
 - `handler_test.go`: `buildRST` の 3 ケース（ACK あり / なし / RST 受信で nil）
 
 > round-trip 用のバイト列は、今の `displayPacket` が出す `received N bytes: ...` の hex をそのまま使える。
