@@ -47,13 +47,13 @@ func ParseTCPHeader(ipSrc, ipDst [4]byte, seg []byte) (TCPHeader, []byte, []byte
 	hdr.DstPort = binary.BigEndian.Uint16(seg[2:4])
 	hdr.Seq = binary.BigEndian.Uint32(seg[4:8])
 	hdr.Ack = binary.BigEndian.Uint32(seg[8:12])
-	hdr.DataOffset = (seg[12] >> 4) * 4
+	hdr.DataOffset = (seg[12] >> 4)
 	hdr.Flags = Flag(seg[13])
 	hdr.Window = binary.BigEndian.Uint16(seg[14:16])
 	hdr.Checksum = binary.BigEndian.Uint16(seg[16:18])
 	hdr.Urgent = binary.BigEndian.Uint16(seg[18:20])
 
-	headerLen := int(hdr.DataOffset)
+	headerLen := int(hdr.DataOffset) * 4
 	if headerLen < 20 {
 		return TCPHeader{}, nil, nil, fmt.Errorf("[TCP] invalid data offset: %d", headerLen)
 	}
