@@ -35,6 +35,7 @@ type Header struct {
 	Urgent   uint16
 }
 
+// src: Source IP, dst: Destination IP
 func (h Header) Serialize(src, dst [4]byte, payload []byte) []byte {
 	buf := make([]byte, 20+len(payload))
 
