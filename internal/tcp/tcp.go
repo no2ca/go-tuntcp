@@ -35,12 +35,33 @@ type Header struct {
 	Urgent   uint16
 }
 
-func Parse(ipSrc, ipDst [4]byte, seg []byte) (Header, []byte, []byte, error) {
+func (h Header) Serialize(src, dst [4]byte, payload []byte) []byte {
+	buf := make([]byte, 20+len(payload))
+
+	binary.BigEndian.PutUint16(buf[0:2], h.SrcPort)
+	binary.BigEndian.PutUint16(buf[2:4], h.DstPort)
+	binary.BigEndian.PutUint32(buf[4:8], h.Seq)
+	binary.BigEndian.PutUint32(buf[8:12], h.Ack)
+	buf[12] = h.DataOffset << 4
+	buf[13] = byte(h.Flags)
+	binary.BigEndian.PutUint16(buf[14:16], h.Window)
+	binary.BigEndian.PutUint16(buf[16:18], 0)
+	binary.BigEndian.PutUint16(buf[18:20], h.Urgent)
+
+	copy(buf[20:], payload)
+
+	s := calculateChecksum(src, dst, buf)
+	binary.BigEndian.PutUint16(buf[16:18], s)
+
+	return buf
+}
+
+func Parse(src, dst [4]byte, seg []byte) (Header, []byte, []byte, error) {
 	if len(seg) < 20 {
 		return Header{}, nil, nil, fmt.Errorf("[TCP] packet too short: %d bytes", len(seg))
 	}
 
-	if !VerifyChecksum(ipSrc, ipDst, seg) {
+	if !VerifyChecksum(src, dst, seg) {
 		return Header{}, nil, nil, fmt.Errorf("checksum mismatch")
 	}
 
