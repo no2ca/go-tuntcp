@@ -39,9 +39,34 @@ func main() {
 		case <-ctx.Done():
 			return
 		case res := <-ch:
-			displayPacket(res)
-			reply := handlePacket(res)
-			dev.Write(reply)
+			packet := res.buf[:res.n]
+			displayRaw(packet)
+
+			ip, ipPayload, err := ipv4.Parse(packet)
+			if err != nil {
+				log.Printf("parse ipv4: %v", err)
+				continue
+			}
+			displayIPv4(ip)
+
+			if ip.Protocol != ipv4.ProtoTCP {
+				continue
+			}
+
+			t, _, tcpPayload, err := tcp.Parse(ip.Src.As4(), ip.Dst.As4(), ipPayload)
+			if err != nil {
+				log.Printf("parse tcp: %v", err)
+				continue
+			}
+			displayTCP(t)
+
+			reply := stack.BuildRST(ip, t, len(tcpPayload))
+			if reply == nil {
+				continue
+			}
+			if _, err := dev.Write(reply); err != nil {
+				log.Printf("write: %v", err)
+			}
 		}
 	}
 }
@@ -70,43 +95,16 @@ func readLoop(ctx context.Context, ch chan readResult, tun io.Reader) {
 	}
 }
 
-func displayPacket(res readResult) {
+func displayRaw(packet []byte) {
 	fmt.Printf("========\n")
-	fmt.Printf("received %d bytes: %  x\n", res.n, res.buf[:res.n])
-
-	ipv4hdr, payload, err := ipv4.Parse(res.buf[:res.n])
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
-	fmt.Printf("Protocol: %v (%s), TTL: %v, Src: %v, Dst: %v\n", ipv4hdr.Protocol, ipv4hdr.StringProtocol(), ipv4hdr.TTL, ipv4hdr.Src, ipv4hdr.Dst)
-
-	if ipv4hdr.Protocol == ipv4.ProtoTCP {
-		hdr, _, _, err := tcp.Parse(ipv4hdr.Src.As4(), ipv4hdr.Dst.As4(), payload)
-		if err != nil {
-			log.Print(err)
-			return
-		}
-		fmt.Printf("SrcPort: %v, DstPort: %v, Seq: %v, Ack: %v\n", hdr.SrcPort, hdr.DstPort, hdr.Seq, hdr.Ack)
-		fmt.Printf("DataOffset: %v, Flags: %v (%v)\n", hdr.DataOffset, hdr.Flags, hdr.StringFlags())
-	}
+	fmt.Printf("[RECEIVED] %d bytes: %  x\n", len(packet), packet)
 }
 
-func handlePacket(res readResult) []byte {
-	ipv4hdr, payload, err := ipv4.Parse(res.buf[:res.n])
-	if err != nil {
-		return nil
-	}
+func displayIPv4(ip ipv4.Header) {
+	fmt.Printf("Protocol: %v (%s), TTL: %v, Src: %v, Dst: %v\n", ip.Protocol, ip.StringProtocol(), ip.TTL, ip.Src, ip.Dst)
+}
 
-	if ipv4hdr.Protocol == ipv4.ProtoTCP {
-		tcpHdr, _, _, err := tcp.Parse(ipv4hdr.Src.As4(), ipv4hdr.Dst.As4(), payload)
-		if err != nil {
-			log.Print(err)
-			return nil
-		}
-		return stack.BuildRST(ipv4hdr, tcpHdr, res.n)
-	} else {
-		return nil
-	}
+func displayTCP(t tcp.Header) {
+	fmt.Printf("SrcPort: %v, DstPort: %v, Seq: %v, Ack: %v\n", t.SrcPort, t.DstPort, t.Seq, t.Ack)
+	fmt.Printf("DataOffset: %v, Flags: %v (%v)\n", t.DataOffset, t.Flags, t.StringFlags())
 }
