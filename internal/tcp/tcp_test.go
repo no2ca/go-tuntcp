@@ -148,6 +148,103 @@ func TestParseTCPHeader_DataOffsetErrors(t *testing.T) {
 	}
 }
 
+func TestSerializeTCPHeader(t *testing.T) {
+	// validStruct を Serialize すると validHeader と一致するはず。
+	// Checksum フィールドの値は無視して再計算されるので、あえて違う値を入れておく。
+	h := validStruct
+	h.Checksum = 0xdead
+	got := h.Serialize(tcpTestSrc, tcpTestDst, nil)
+	if !bytes.Equal(got, validHeader) {
+		t.Errorf("Serialize =\n%x, want\n%x", got, validHeader)
+	}
+}
+
+func TestSerializeTCPHeader_WithPayload(t *testing.T) {
+	// TestParseTCPHeader_WithPayload と同じセグメント ("hello" 付き、チェックサム 0x276b)。
+	want := append([]byte{}, validHeader...)
+	want[16], want[17] = 0x27, 0x6b
+	want = append(want, []byte("hello")...)
+
+	got := validStruct.Serialize(tcpTestSrc, tcpTestDst, []byte("hello"))
+	if !bytes.Equal(got, want) {
+		t.Errorf("Serialize =\n%x, want\n%x", got, want)
+	}
+}
+
+func TestSerializeTCPHeader_Fields(t *testing.T) {
+	// 各フィールドが正しいオフセット・バイトオーダーで書かれているか、境界値で確認する。
+	h := Header{
+		SrcPort:    0xffff,
+		DstPort:    0x0001,
+		Seq:        0x01020304,
+		Ack:        0xfffffffe,
+		DataOffset: 5,
+		Flags:      FlagURG | FlagACK | FlagPSH | FlagRST | FlagSYN | FlagFIN,
+		Window:     0x1234,
+		Urgent:     0xabcd,
+	}
+	got := h.Serialize(tcpTestSrc, tcpTestDst, nil)
+
+	want := []byte{
+		0xff, 0xff, 0x00, 0x01,
+		0x01, 0x02, 0x03, 0x04,
+		0xff, 0xff, 0xff, 0xfe,
+		0x50, 0x3f, 0x12, 0x34,
+		0x00, 0x00, 0xab, 0xcd,
+	}
+	// チェックサムは calculateChecksum で埋める (値の正しさは TestCalculateTCPChecksum で担保)。
+	cs := calculateChecksum(tcpTestSrc, tcpTestDst, want)
+	want[16], want[17] = byte(cs>>8), byte(cs)
+
+	if !bytes.Equal(got, want) {
+		t.Errorf("Serialize =\n%x, want\n%x", got, want)
+	}
+}
+
+func TestSerializeTCPHeader_RoundTrip(t *testing.T) {
+	// Serialize -> Parse で元のヘッダとペイロードに戻ること。
+	// Parse 側でチェックサム検証を通る = Serialize が正しいチェックサムを書いている。
+	h := Header{
+		SrcPort:    443,
+		DstPort:    54321,
+		Seq:        0xdeadbeef,
+		Ack:        0xcafebabe,
+		DataOffset: 5,
+		Flags:      FlagACK | FlagPSH,
+		Window:     65535,
+		Urgent:     0,
+	}
+	payload := []byte("round trip")
+
+	seg := h.Serialize(tcpTestSrc, tcpTestDst, payload)
+
+	parsed, options, gotPayload, err := Parse(tcpTestSrc, tcpTestDst, seg)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	// Parse は Checksum を埋めて返すので、比較用にコピーしておく。
+	h.Checksum = parsed.Checksum
+	if parsed != h {
+		t.Errorf("header = %+v, want %+v", parsed, h)
+	}
+	if len(options) != 0 {
+		t.Errorf("options = %x, want empty", options)
+	}
+	if !bytes.Equal(gotPayload, payload) {
+		t.Errorf("payload = %q, want %q", gotPayload, payload)
+	}
+}
+
+func TestSerializeTCPHeader_DoesNotAliasPayload(t *testing.T) {
+	// 返り値は新しいバッファなので、呼び出し元の payload を書き換えても影響しない。
+	payload := []byte("abc")
+	seg := validStruct.Serialize(tcpTestSrc, tcpTestDst, payload)
+	payload[0] = 'z'
+	if !bytes.Equal(seg[20:], []byte("abc")) {
+		t.Errorf("payload in segment = %q, want %q", seg[20:], "abc")
+	}
+}
+
 func TestCalculateTCPChecksum(t *testing.T) {
 	seg := append([]byte{}, validHeader...)
 	seg[16], seg[17] = 0, 0
