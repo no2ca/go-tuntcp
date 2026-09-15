@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -52,8 +53,9 @@ func readLoop(ctx context.Context, ch chan readResult, tun io.Reader) {
 	buf := make([]byte, 1500)
 	for {
 		n, err := tun.Read(buf)
+		res := bytes.Clone(buf[:n])
 		select {
-		case ch <- readResult{n: n, buf: buf}:
+		case ch <- readResult{n: n, buf: res}:
 		case <-ctx.Done():
 			return
 		}
