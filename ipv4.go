@@ -92,7 +92,7 @@ func ParseIPv4Header(buf []byte) (IPv4Header, []byte, error) {
 	if int(hdr.TotalLen) > len(buf) {
 		return IPv4Header{}, nil, fmt.Errorf("total length %d exceeds buffer size %d", hdr.TotalLen, len(buf))
 	}
-	
+
 	// Identification
 	hdr.ID = binary.BigEndian.Uint16(buf[4:6])
 	// TTL

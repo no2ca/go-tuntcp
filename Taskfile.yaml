@@ -24,3 +24,9 @@ tasks:
     cmds:
       - task setup-interface
       - task curl
+  test:
+    cmds:
+      - go test ./...
+  test-verbose:
+    cmds:
+      - go test -v ./...
