@@ -86,6 +86,43 @@ type Connection struct {
 	tcp.ControlBlock
 }
 
+func (c *Connection) Handle(t tcp.Header, payload []byte) []byte {
+	// 1: Sequence Number
+
+	// 2: RST
+
+	// 3: Security Check
+
+	// 4: SYN
+	if t.HasFlag(tcp.FlagSYN) {
+		switch c.State {
+		case tcp.StateSynReceived:
+			c.State = tcp.StateListen
+			return nil
+		}
+	}
+
+	// 5: ACK
+	if !t.HasFlag(tcp.FlagACK) {
+		return nil
+	}
+	switch c.State {
+	case tcp.StateSynReceived:
+		c.State = tcp.StateEstablished
+		c.Snd.UNA = t.Ack
+		c.Snd.WND = t.Window
+		c.Snd.WL1 = t.Seq
+		c.Snd.WL2 = t.Ack
+		// TODO: ACKが許容範囲外の場合RST
+	}
+
+	// 6: URG
+
+	// 7: Segment Text
+
+	return nil
+}
+
 type Stack struct {
 	listeners map[uint16]struct{}     // LISTEN中のポート
 	conns     map[connKey]*Connection // 確立中の接続（SYN-RECEIVED以降）
@@ -117,8 +154,8 @@ func (s *Stack) Handle(ip ipv4.Header, t tcp.Header, payload []byte) []byte {
 	}
 
 	// 既存の接続
-	if _, ok := s.conns[key]; ok {
-		return nil
+	if c, ok := s.conns[key]; ok {
+		return c.Handle(t, payload)
 	}
 
 	// RSTを受信したとき
@@ -134,13 +171,18 @@ func (s *Stack) Handle(ip ipv4.Header, t tcp.Header, payload []byte) []byte {
 			return buildRST(ip, t, len(payload))
 		case t.HasFlag(tcp.FlagSYN):
 			c := &Connection{Key: key}
+
 			c.Rcv.NXT = t.Seq + 1
 			c.Rcv.IRS = t.Seq
 			c.Rcv.WND = defaultWndSize
+
 			c.Snd.ISS = s.ISS()
 			c.Snd.UNA = c.Snd.ISS
+			c.Snd.NXT = c.Snd.ISS + 1
+
 			c.State = tcp.StateSynReceived
 			s.conns[key] = c
+
 			return buildSegment(key.Local, key.Remote, tcp.FlagSYN|tcp.FlagACK, c.Snd.ISS, c.Rcv.NXT, c.Rcv.WND, nil)
 		default:
 			return nil
