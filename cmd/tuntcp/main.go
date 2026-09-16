@@ -35,6 +35,7 @@ func main() {
 	go readLoop(ctx, ch, dev)
 	
 	stk := stack.New()
+	stk.Listen(80)
 
 	for {
 		select {

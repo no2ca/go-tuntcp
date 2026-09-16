@@ -8,6 +8,10 @@ import (
 	"net/netip"
 )
 
+const (
+	defaultWndSize = 65535
+)
+
 // RFC 9293 3.10.7.1 (CLOSED STATE)
 func buildRST(ip ipv4.Header, t tcp.Header, payloadLen int) []byte {
 	if t.HasFlag(tcp.FlagRST) {
@@ -35,7 +39,7 @@ func buildRST(ip ipv4.Header, t tcp.Header, payloadLen int) []byte {
 		flags = tcp.FlagRST | tcp.FlagACK
 	}
 
-	var wnd uint16 = 65535
+	var wnd uint16 = defaultWndSize
 	local := netip.AddrPortFrom(ip.Dst, t.DstPort)
 	remote := netip.AddrPortFrom(ip.Src, t.SrcPort)
 
@@ -90,8 +94,8 @@ type Stack struct {
 
 func New() *Stack {
 	return &Stack{
-		listeners: nil,
-		conns:     nil,
+		listeners: make(map[uint16]struct{}),
+		conns:     make(map[connKey]*Connection),
 		ISS:       randomISS,
 	}
 }
@@ -114,15 +118,35 @@ func (s *Stack) Handle(ip ipv4.Header, t tcp.Header, payload []byte) []byte {
 
 	// 既存の接続
 	if _, ok := s.conns[key]; ok {
-		panic("stack.Stack.Handle: unreachable")
+		return nil
 	}
 
-	// 新しい接続
+	// RSTを受信したとき
+	if t.HasFlag(tcp.FlagRST) {
+		return nil
+	}
+
+	// 新しい接続 (RFC9293 3.10.7.2)
 	if _, ok := s.listeners[t.DstPort]; ok {
-		// ポートをlistenしているとき
-		panic("stack.Stack.Handle: unreachable")
+		// TODO: セキュリティ情報が一致しない場合の処理について確認
+		switch {
+		case t.HasFlag(tcp.FlagACK):
+			return buildRST(ip, t, len(payload))
+		case t.HasFlag(tcp.FlagSYN):
+			c := &Connection{Key: key}
+			c.Rcv.NXT = t.Seq + 1
+			c.Rcv.IRS = t.Seq
+			c.Rcv.WND = defaultWndSize
+			c.Snd.ISS = s.ISS()
+			c.Snd.UNA = c.Snd.ISS
+			c.State = tcp.StateSynReceived
+			s.conns[key] = c
+			return buildSegment(key.Local, key.Remote, tcp.FlagSYN|tcp.FlagACK, c.Snd.ISS, c.Rcv.NXT, c.Rcv.WND, nil)
+		default:
+			return nil
+		}
 	}
 
-	// ポートが閉じている場合
+	// ポートが閉じているとき
 	return buildRST(ip, t, len(payload))
 }
