@@ -127,7 +127,7 @@ func TestBuildRST(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, _, pkt := BuildRST(incomingIP(), tt.in, tt.payloadLen)
+			pkt := BuildRST(incomingIP(), tt.in, tt.payloadLen)
 			if pkt == nil {
 				t.Fatal("buildRST returned nil, want a packet")
 			}
@@ -188,7 +188,7 @@ func TestBuildRST_IgnoresRST(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, _, pkt := BuildRST(incomingIP(), tt.in, 0); pkt != nil {
+			if pkt := BuildRST(incomingIP(), tt.in, 0); pkt != nil {
 				t.Errorf("buildRST = %x, want nil", pkt)
 			}
 		})

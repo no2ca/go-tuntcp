@@ -60,10 +60,18 @@ func main() {
 			}
 			displayTCP(t)
 
-			ip, t, reply := stack.BuildRST(ip, t, len(tcpPayload))
+			reply := stack.BuildRST(ip, t, len(tcpPayload))
 			if reply == nil {
 				continue
 			}
+
+			repIP, repIPPayload, err := ipv4.Parse(reply)
+			if err != nil {
+				log.Printf("parse reply: %v", err)
+				continue
+			}
+
+			repTCP, _, _, err := tcp.Parse(ip.Src.As4(), ip.Dst.As4(), repIPPayload)
 
 			if _, err := dev.Write(reply); err != nil {
 				log.Printf("write: %v", err)
@@ -71,8 +79,8 @@ func main() {
 			}
 
 			displayRawTx(reply)
-			displayIPv4(ip)
-			displayTCP(t)
+			displayIPv4(repIP)
+			displayTCP(repTCP)
 		}
 	}
 }
