@@ -33,6 +33,8 @@ func main() {
 
 	ch := make(chan readResult)
 	go readLoop(ctx, ch, dev)
+	
+	stk := stack.New()
 
 	for {
 		select {
@@ -60,7 +62,7 @@ func main() {
 			}
 			displayTCP(t)
 
-			reply := stack.BuildRST(ip, t, len(tcpPayload))
+			reply := stk.Handle(ip, t, tcpPayload)
 			if reply == nil {
 				continue
 			}
