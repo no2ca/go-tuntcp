@@ -155,7 +155,13 @@ func (s *Stack) Handle(ip ipv4.Header, t tcp.Header, payload []byte) []byte {
 
 	// 既存の接続
 	if c, ok := s.conns[key]; ok {
-		return c.Handle(t, payload)
+		reply := c.Handle(t, payload)
+		// LISTEN か CLOSED に戻った接続はテーブルから消す。
+		// LISTEN はポート単位で listeners が受け持つので、接続を残す必要はない
+		if c.State == tcp.StateListen || c.State == tcp.StateClosed {
+			delete(s.conns, key)
+		}
+		return reply
 	}
 
 	// RSTを受信したとき
