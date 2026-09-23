@@ -287,9 +287,9 @@ func TestHeader_StringFlags(t *testing.T) {
 	}{
 		{0, "None"},
 		{FlagSYN, "SYN"},
-		{FlagSYN | FlagACK, "ACK | SYN"},
-		{FlagFIN | FlagPSH | FlagACK, "ACK | PSH | FIN"},
-		{FlagURG | FlagACK | FlagPSH | FlagRST | FlagSYN | FlagFIN, "URG | ACK | PSH | RST | SYN | FIN"},
+		{FlagSYN | FlagACK, "SYN | ACK"},
+		{FlagFIN | FlagPSH | FlagACK, "FIN | PSH | ACK"},
+		{FlagURG | FlagACK | FlagPSH | FlagRST | FlagSYN | FlagFIN, "FIN | SYN | RST | PSH | ACK | URG"},
 	}
 	for _, tt := range tests {
 		h := Header{Flags: tt.flags}

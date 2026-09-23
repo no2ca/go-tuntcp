@@ -119,12 +119,12 @@ var flagNames = []struct {
 	flag Flag
 	name string
 }{
-	{FlagURG, "URG"},
-	{FlagACK, "ACK"},
-	{FlagPSH, "PSH"},
-	{FlagRST, "RST"},
-	{FlagSYN, "SYN"},
 	{FlagFIN, "FIN"},
+	{FlagSYN, "SYN"},
+	{FlagRST, "RST"},
+	{FlagPSH, "PSH"},
+	{FlagACK, "ACK"},
+	{FlagURG, "URG"},
 }
 
 func (h *Header) StringFlags() string {
