@@ -18,13 +18,7 @@ func buildRST(ip ipv4.Header, t tcp.Header, payloadLen int) []byte {
 		return nil
 	}
 
-	segLen := uint32(payloadLen)
-	if t.HasFlag(tcp.FlagSYN) {
-		segLen++
-	}
-	if t.HasFlag(tcp.FlagFIN) {
-		segLen++
-	}
+	segLen := segmentLength(t, payloadLen)
 
 	var seq, ack uint32
 	var flags tcp.Flag
@@ -46,6 +40,18 @@ func buildRST(ip ipv4.Header, t tcp.Header, payloadLen int) []byte {
 	seg := buildSegment(local, remote, flags, seq, ack, wnd, nil)
 
 	return seg
+}
+
+// SEG.LEN: シーケンス番号を消費する長さ。SYN と FIN はそれぞれ 1 として数える
+func segmentLength(t tcp.Header, payloadLen int) uint32 {
+	segLen := uint32(payloadLen)
+	if t.HasFlag(tcp.FlagSYN) {
+		segLen++
+	}
+	if t.HasFlag(tcp.FlagFIN) {
+		segLen++
+	}
+	return segLen
 }
 
 func buildSegment(local, remote netip.AddrPort, flags tcp.Flag, seq, ack uint32, wnd uint16, payload []byte) []byte {
@@ -86,8 +92,41 @@ type Connection struct {
 	tcp.ControlBlock
 }
 
+// RFC 9293 3.10.7.4 First の表。受信ウィンドウ [RCV.NXT, RCV.NXT+RCV.WND) との重なりで判定する
+//
+//	SEG.LEN  RCV.WND  受理する条件
+//	0        0        SEG.SEQ = RCV.NXT
+//	0        >0       RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
+//	>0       0        受理しない
+//	>0       >0       先頭 (SEG.SEQ) か末尾 (SEG.SEQ+SEG.LEN-1) がウィンドウ内
+func (c *Connection) acceptable(seq, segLen uint32) bool {
+	wnd := uint32(c.Rcv.WND)
+	inWindow := func(n uint32) bool {
+		return tcp.SeqLE(c.Rcv.NXT, n) && tcp.SeqLT(n, c.Rcv.NXT+wnd)
+	}
+
+	switch {
+	case segLen == 0 && wnd == 0:
+		return seq == c.Rcv.NXT
+	case segLen == 0:
+		return inWindow(seq)
+	case wnd == 0:
+		return false
+	default:
+		return inWindow(seq) || inWindow(seq+segLen-1)
+	}
+}
+
 func (c *Connection) Handle(t tcp.Header, payload []byte) []byte {
 	// 1: Sequence Number
+	if !c.acceptable(t.Seq, segmentLength(t, len(payload))) {
+		// RST は受理できなくても返信しない（RST に応答すると RST の応酬になる）
+		if t.HasFlag(tcp.FlagRST) {
+			return nil
+		}
+		// 今の SND.NXT と RCV.NXT を ACK で教え直して捨てる
+		return buildSegment(c.Key.Local, c.Key.Remote, tcp.FlagACK, c.Snd.NXT, c.Rcv.NXT, c.Rcv.WND, nil)
+	}
 
 	// 2: RST
 

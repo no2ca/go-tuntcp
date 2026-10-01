@@ -50,11 +50,12 @@ LLM が書くもの:
 - [x] **T4-2** [LLM] 接続を接続テーブルから消す仕組み
   - 接続が LISTEN か CLOSED に戻ったら、`Stack.Handle` が `conns` から削除する
   - T4-4 と T4-5 の前提
-- [ ] **T4-3** [人間] セグメントの受理判定（First: シーケンス番号の検査）
+- [x] **T4-3** [人間] セグメントの受理判定（First: シーケンス番号の検査）
   - RFC 9293 [3.10.7.4](https://datatracker.ietf.org/doc/html/rfc9293#section-3.10.7.4) First の表（SEG.LEN と RCV.WND がそれぞれ 0 かどうかで 4 通り）
   - 受理できなければ `<SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>` を返して捨てる。RST が立っていれば何も返さない
   - modulo 2^32 の比較には `tcp.SeqLT` / `tcp.SeqLE` を使う
   - テスト: `SynReceived_OldSeq_ReACKed`, `SynReceived_RetransmittedSYN`, `Established_UnexpectedSeq`, `Established_ZeroWindow`
+  - `Established_UnexpectedSeq` の「out of order」と「overlapping」はウィンドウ内なので First では受理される。RCV.NXT と一致しないデータに ACK を返すのは T4-7 で扱う
 - [ ] **T4-4** [人間] RST の受信（Second）
   - SYN-RECEIVED（passive open）なら LISTEN に戻る。ESTABLISHED なら接続を閉じる
   - テスト: `SynReceived_RST_ReturnsToListen`, `Established_RST_Closes`
