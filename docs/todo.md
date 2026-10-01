@@ -56,7 +56,7 @@ LLM が書くもの:
   - modulo 2^32 の比較には `tcp.SeqLT` / `tcp.SeqLE` を使う
   - テスト: `SynReceived_OldSeq_ReACKed`, `SynReceived_RetransmittedSYN`, `Established_UnexpectedSeq`, `Established_ZeroWindow`
   - `Established_UnexpectedSeq` の「out of order」と「overlapping」はウィンドウ内なので First では受理される。RCV.NXT と一致しないデータに ACK を返すのは T4-7 で扱う
-- [ ] **T4-4** [人間] RST の受信（Second）
+- [x] **T4-4** [人間] RST の受信（Second）
   - SYN-RECEIVED（passive open）なら LISTEN に戻る。ESTABLISHED なら接続を閉じる
   - テスト: `SynReceived_RST_ReturnsToListen`, `Established_RST_Closes`
   - RFC 5961 の challenge ACK は後回し（M13）

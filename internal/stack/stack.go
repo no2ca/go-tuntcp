@@ -129,6 +129,19 @@ func (c *Connection) Handle(t tcp.Header, payload []byte) []byte {
 	}
 
 	// 2: RST
+	// First を通った RST はウィンドウ内にある。RFC 5961 の challenge ACK（RCV.NXT と完全一致しない RST への対策）は M13 で扱う
+	if t.HasFlag(tcp.FlagRST) {
+		switch c.State {
+		case tcp.StateSynReceived:
+			// passive open（LISTEN から来た接続）なので LISTEN に戻る。
+			// active open（SYN-SENT から来た接続）なら CLOSED にするが、まだ active open がない（M11）
+			c.State = tcp.StateListen
+		case tcp.StateEstablished:
+			// 相手が接続を捨てた。こちらも閉じて TCB を消す
+			c.State = tcp.StateClosed
+		}
+		return nil
+	}
 
 	// 3: Security Check
 
