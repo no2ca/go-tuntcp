@@ -146,12 +146,15 @@ func (c *Connection) Handle(t tcp.Header, payload []byte) []byte {
 	// 3: Security Check
 
 	// 4: SYN
+	// First を通った SYN はウィンドウ内にある。SYN の再送（SEG.SEQ = IRS）はウィンドウ外なので First で ACK を返している
 	if t.HasFlag(tcp.FlagSYN) {
 		switch c.State {
 		case tcp.StateSynReceived:
+			// passive open なので LISTEN に戻る（T4-4 の RST と同じ）
 			c.State = tcp.StateListen
 			return nil
 		}
+		// ESTABLISHED 以降の SYN には RFC 5961 の challenge ACK を返す。M13 で扱う
 	}
 
 	// 5: ACK

@@ -60,7 +60,7 @@ LLM が書くもの:
   - SYN-RECEIVED（passive open）なら LISTEN に戻る。ESTABLISHED なら接続を閉じる
   - テスト: `SynReceived_RST_ReturnsToListen`, `Established_RST_Closes`
   - RFC 5961 の challenge ACK は後回し（M13）
-- [ ] **T4-5** [LLM] ウィンドウ内の SYN（Fourth）を受けたら LISTEN に戻す
+- [x] **T4-5** [LLM] ウィンドウ内の SYN（Fourth）を受けたら LISTEN に戻す
   - T4-4 と同じ形
   - テスト: `SynReceived_NewSYNInWindow_ReturnsToListen`
 - [ ] **T4-6** [人間] SYN-RECEIVED での ACK の範囲チェック（Fifth）
