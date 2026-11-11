@@ -378,3 +378,185 @@ func TestWrite_Closed_ReturnsError(t *testing.T) {
 		t.Errorf("sent %d segments on a closed connection, want 0", len(segs))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// T6-6: ESTABLISHED での ACK の処理 (RFC 9293 3.10.7.4 Fifth、ESTABLISHED STATE)
+// ---------------------------------------------------------------------------
+
+func TestHandle_Established_ACK(t *testing.T) {
+	// "hello" を送ったあと (SND.UNA = ISS+1、SND.NXT = ISS+6) に、ACK 番号の違う ACK を受ける。
+	//   SND.UNA < SEG.ACK =< SND.NXT なら SND.UNA <- SEG.ACK
+	//   SEG.ACK =< SND.UNA (重複) なら無視する
+	//   SEG.ACK > SND.NXT (まだ送っていない範囲) なら ACK を返して捨てる
+	const una, nxt = testISS + 1, testISS + 6
+	tests := []struct {
+		name    string
+		ack     uint32
+		wantUNA uint32
+		wantACK bool // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK> を返すか
+	}{
+		{"SEG.ACK == SND.NXT", nxt, nxt, false},
+		{"SEG.ACK == SND.UNA + 1", una + 1, una + 1, false},
+		{"SEG.ACK == SND.UNA (duplicate)", una, una, false},
+		{"SEG.ACK == SND.UNA - 1 (old duplicate)", una - 1, una, false},
+		{"SEG.ACK == SND.NXT + 1 (not yet sent)", nxt + 1, una, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestStack()
+			c := establish(t, s)
+			c.Write([]byte("hello"))
+			takeSent(t, s)
+
+			reply := s.Handle(incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, tt.ack), nil)
+			if tt.wantACK {
+				th, _ := mustReply(t, reply)
+				checkSegment(t, th, tcp.FlagACK, nxt, clientISN+1)
+			} else if reply != nil {
+				t.Errorf("reply = %x, want nil", reply)
+			}
+			if c.Snd.UNA != tt.wantUNA {
+				t.Errorf("Snd.UNA = %d, want %d", c.Snd.UNA, tt.wantUNA)
+			}
+			if c.Snd.NXT != nxt {
+				t.Errorf("Snd.NXT = %d, want %d (unchanged)", c.Snd.NXT, nxt)
+			}
+		})
+	}
+}
+
+func TestHandle_Established_ACKForUnsentData_DropsSegment(t *testing.T) {
+	// SEG.ACK > SND.NXT: "send an ACK, drop the segment, and return"。
+	// 同じセグメントに載ったデータも受け取らない
+	s := newTestStack()
+	c := establish(t, s)
+
+	th, _ := mustReply(t, s.Handle(incomingIP(), incomingTCP(tcp.FlagPSH|tcp.FlagACK, clientISN+1, testISS+2), []byte("hi")))
+	checkSegment(t, th, tcp.FlagACK, testISS+1, clientISN+1)
+	if c.Rcv.NXT != clientISN+1 {
+		t.Errorf("Rcv.NXT = %d, want %d (segment dropped)", c.Rcv.NXT, clientISN+1)
+	}
+	if got := readAll(c); got != "" {
+		t.Errorf("Read = %q, want empty (segment dropped)", got)
+	}
+}
+
+func TestHandle_Established_ACK_SndUnaWrapsAround(t *testing.T) {
+	// ISS = 0xfffffffe で "hello" を送ると SND.UNA = 0xffffffff、SND.NXT = 4。
+	// SEG.ACK = 2 は 2^32 をまたいで SND.UNA より後ろにあり、受け入れる
+	s := newTestStack()
+	s.ISS = func() uint32 { return 0xfffffffe }
+	s.Handle(incomingIP(), incomingTCP(tcp.FlagSYN, clientISN, 0), nil)
+	s.Handle(incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, 0xffffffff), nil)
+	c := s.conns[testKey()]
+	if c == nil {
+		t.Fatal("connection not registered")
+	}
+	c.Write([]byte("hello"))
+	takeSent(t, s)
+
+	if reply := s.Handle(incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, 2), nil); reply != nil {
+		t.Errorf("reply = %x, want nil", reply)
+	}
+	if c.Snd.UNA != 2 {
+		t.Errorf("Snd.UNA = %d, want 2", c.Snd.UNA)
+	}
+}
+
+func TestHandle_Established_ACK_SendsRemainingData(t *testing.T) {
+	// 相手のウィンドウ 5 で "hello world" を書くと "hello" だけ出る。
+	// "hello" への ACK でウィンドウが SND.UNA = ISS+6 から 5 バイト分に動き、" worl" を送れる。
+	// ACK を受けた "hello" は送信バッファから取り除かれているので、続きは " worl" になる
+	s := newTestStack()
+	c := establishWithWindow(t, s, 5)
+	c.Write([]byte("hello world"))
+	takeSent(t, s)
+
+	ack := incomingTCP(tcp.FlagACK, clientISN+1, testISS+6)
+	ack.Window = 5
+	s.Handle(incomingIP(), ack, nil)
+
+	segs := takeSent(t, s)
+	if len(segs) != 1 {
+		t.Fatalf("sent %d segments, want 1", len(segs))
+	}
+	checkSegment(t, segs[0].hdr, tcp.FlagACK, testISS+6, clientISN+1)
+	if string(segs[0].payload) != " worl" {
+		t.Errorf("payload = %q, want %q", segs[0].payload, " worl")
+	}
+}
+
+func TestHandle_Established_WindowUpdate(t *testing.T) {
+	// SND.UNA =< SEG.ACK =< SND.NXT のとき、
+	// (SND.WL1 < SEG.SEQ or (SND.WL1 = SEG.SEQ and SND.WL2 =< SEG.ACK)) なら SND.WND <- SEG.WND。
+	// 古いセグメント (SEG.SEQ < SND.WL1) でウィンドウを戻さないための条件。
+	//
+	// 準備: ウィンドウ 5 で "hello world" を書き、"hello" だけ送った状態。
+	// 相手から "abc" (SEQ = clientISN+1) と "de" (SEQ = clientISN+4) を受け、SND.WL1 = clientISN+4 にしておく。
+	// そこへウィンドウ 100 を広告するセグメントを送る。更新されれば " world" が出る
+	const wl1 = clientISN + 4
+	tests := []struct {
+		name    string
+		seq     uint32
+		payload []byte
+		wantWND uint16
+	}{
+		// RCV.NXT は clientISN+6。SEG.SEQ がそれより前のセグメントは、RCV.NXT をまたぐデータを
+		// 載せないと First で捨てられて Fifth まで来ないので、データを付ける
+		{"SEG.SEQ == SND.WL1", wl1, []byte("def"), 100},
+		{"SEG.SEQ > SND.WL1", wl1 + 2, nil, 100},
+		{"SEG.SEQ < SND.WL1 (old segment)", wl1 - 1, []byte("cdef"), 5},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestStack()
+			c := establishWithWindow(t, s, 5)
+			c.Write([]byte("hello world"))
+			takeSent(t, s)
+			for _, d := range []struct {
+				seq  uint32
+				data string
+			}{{clientISN + 1, "abc"}, {clientISN + 4, "de"}} {
+				in := incomingTCP(tcp.FlagPSH|tcp.FlagACK, d.seq, testISS+1)
+				in.Window = 5
+				s.Handle(incomingIP(), in, []byte(d.data))
+			}
+			if c.Snd.WL1 != wl1 {
+				t.Fatalf("setup: Snd.WL1 = %d, want %d", c.Snd.WL1, wl1)
+			}
+			takeSent(t, s)
+
+			in := incomingTCP(tcp.FlagACK, tt.seq, testISS+1)
+			in.Window = 100
+			s.Handle(incomingIP(), in, tt.payload)
+
+			if c.Snd.WND != tt.wantWND {
+				t.Errorf("Snd.WND = %d, want %d", c.Snd.WND, tt.wantWND)
+			}
+			if tt.wantWND == 100 {
+				segs := takeSent(t, s)
+				if len(segs) != 1 || string(segs[0].payload) != " world" {
+					t.Errorf("after window update: sent %d segments, want 1 with %q", len(segs), " world")
+				}
+			}
+		})
+	}
+}
+
+func TestHandle_Established_WindowShrinks(t *testing.T) {
+	// 相手がウィンドウを縮め、右端 (SND.UNA + SND.WND) が SND.NXT より左に来たら、何も送らない。
+	// ウィンドウ 10 で 10 バイト送ったあと、SEG.ACK = ISS+3、SEG.WND = 1 を受けると、右端は ISS+4、SND.NXT は ISS+11
+	s := newTestStack()
+	c := establishWithWindow(t, s, 10)
+	c.Write(repeat(10))
+	takeSent(t, s)
+
+	ack := incomingTCP(tcp.FlagACK, clientISN+1, testISS+3)
+	ack.Window = 1
+	s.Handle(incomingIP(), ack, nil)
+	c.Write([]byte("more"))
+
+	if segs := takeSent(t, s); len(segs) != 0 {
+		t.Errorf("sent %d segments beyond a shrunk window, want 0", len(segs))
+	}
+}
