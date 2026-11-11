@@ -10,6 +10,7 @@ internal/tun/       TUN デバイスの作成 (ioctl)
 internal/checksum/  インターネットチェックサム (Sum / Fold)
 internal/ipv4/      IPv4 ヘッダのパース・シリアライズ
 internal/tcp/       TCP ヘッダのパース・チェックサム、状態と TCB
+scripts/            task から呼ぶシェルスクリプト (e2e.sh)
 docs/               マイルストーンと次のステップの解説
 ```
 
@@ -34,6 +35,12 @@ sudo ./go-tuntcp
 task setup-interface        # tun0 に 10.10.0.1 を割り当てて up (内部で sudo を実行)
 task ping                   # 10.10.0.2 に ping → ICMP が表示される
 task curl                   # 10.10.0.2 に curl → TCP SYN が表示される
+```
+
+上の手順を 1 つのターミナルでまとめて実行することもできます。ビルドしたバイナリに `setcap` で `CAP_NET_ADMIN` を付与してバックグラウンドで起動し、IP の割り当てと `curl` を行ってから終了します。
+
+```sh
+task e2e
 ```
 
 ## テスト
