@@ -8,8 +8,8 @@ vars:
 tasks:
   setup-interface:
     cmds:
-      - ip addr add {{.TUN_IP}} peer {{.TUN_PEER_IP}} dev {{.TUN_NAME}}
-      - ip link set tun0 up
+      - sudo ip addr add {{.TUN_IP}} peer {{.TUN_PEER_IP}} dev {{.TUN_NAME}}
+      - sudo ip link set {{.TUN_NAME}} up
   ping:
     cmds:
       - ping {{.TUN_PEER_IP}}
@@ -18,12 +18,12 @@ tasks:
       - curl {{.TUN_PEER_IP}}
   ping-test:
     cmds:
-      - task setup-interface
-      - task ping
+      - task: setup-interface
+      - task: ping
   curl-test:
     cmds:
-      - task setup-interface
-      - task curl
+      - task: setup-interface
+      - task: curl
   test:
     cmds:
       - go test ./...

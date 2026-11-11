@@ -28,10 +28,10 @@ go build -o go-tuntcp ./cmd/tuntcp
 sudo ./go-tuntcp
 ```
 
-別ターミナルでIPアドレスの割り当てやパケットの送信を行います。
+別ターミナルでIPアドレスの割り当てやパケットの送信を行います。root 権限が必要なコマンドは Taskfile の中で `sudo` を付けているので、`task` 自体は `sudo` なしで実行します。
 
 ```sh
-sudo task setup-interface   # tun0 に 10.10.0.1 を割り当てて up
+task setup-interface        # tun0 に 10.10.0.1 を割り当てて up (内部で sudo を実行)
 task ping                   # 10.10.0.2 に ping → ICMP が表示される
 task curl                   # 10.10.0.2 に curl → TCP SYN が表示される
 ```

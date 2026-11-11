@@ -450,7 +450,7 @@ TUN 無しで `go test ./...` だけで検証できるように書いてくだ�
 ## 動作確認
 
 1. `go test ./...` が通る
-2. `sudo ./go-tuntcp` を起動 → 別ターミナルで `sudo task setup-interface` → `curl -m 5 10.10.0.2`
+2. `sudo ./go-tuntcp` を起動 → 別ターミナルで `task setup-interface` → `curl -m 5 10.10.0.2`
    - **before**: `Connection refused` で即失敗
    - **after**: 5 秒待ってタイムアウト（`Empty reply` など）。**ハングするのが成功です。**
      接続は確立したがサーバが応答を返さないので、curl は待ち続けています
