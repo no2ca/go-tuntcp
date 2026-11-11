@@ -1,6 +1,6 @@
 # go-tuntcp
 
-TUN デバイスの上に、Go でユーザー空間の TCP プロトコルスタックを実装するプロジェクトです。TUN デバイスから生の IP パケットを読み書きし、IPv4 と TCP を自前で処理します。いまは 3-way handshake で接続を確立するところまで動きます。
+TUN デバイスの上に、Go でユーザー空間の TCP プロトコルスタックを実装するプロジェクトです。TUN デバイスから生の IP パケットを読み書きし、IPv4 と TCP を自前で処理します。ひとまずの目標は、自作の型が `net.Listener` と `net.Conn` を満たし、標準の `net/http` サーバがその上でそのまま動くことです。いまは 3-way handshake で接続を確立するところまで動きます。
 
 ## ディレクトリ構成
 
@@ -17,7 +17,7 @@ docs/               ロードマップと設計
 
 ## ドキュメント
 
-- [docs/roadmap.md](docs/roadmap.md): マイルストーン、タスク、現在の状態
+- [docs/roadmap.md](docs/roadmap.md): 目標、マイルストーン、タスク、現在の状態
 - [docs/design.md](docs/design.md): パッケージの構成、パケットの流れ、設計の決まりごと
 - [CLAUDE.md](CLAUDE.md): 開発の進め方。実装は AI が主導し、人間はタスクを選び、差分を読んでコミットします
 
