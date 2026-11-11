@@ -189,12 +189,42 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 			return buildSegment(c.Key.Local, c.Key.Remote, tcp.FlagRST, t.Ack, 0, c.Rcv.WND, nil)
 		}
 		c.State = tcp.StateEstablished
-		c.Snd.UNA = t.Ack
 		c.Snd.WND = t.Window
 		c.Snd.WL1 = t.Seq
 		c.Snd.WL2 = t.Ack
-		// やっていないこと: ESTABLISHED での ACK の処理 (未実装。T6-6)。
-		// 仕様では、ESTABLISHED に入ったあと続けてその処理を通る
+		// 仕様では SND.UNA は下の ESTABLISHED の処理で進む。ここで先に進めておくのは、
+		// SYN が使った 1 はデータではないので、送信バッファから取り除かせないため。
+		// 下の処理からは重複した ACK に見え、SND.UNA と送信バッファには触らない
+		c.Snd.UNA = t.Ack
+		// 仕様どおり、続けて ESTABLISHED の処理を通る
+		fallthrough
+	case tcp.StateEstablished:
+		// 送ったデータへの ACK を受け、SND.UNA を進め、ACK されたデータを送信バッファから捨てる。
+		// 重複した ACK (SEG.ACK =< SND.UNA) は無視するが、セグメントの処理は続ける
+		// (ウィンドウの更新やデータの受け取りがありうる)。
+		// まだ送っていない範囲への ACK は、相手が混乱しているので、いまの状態を ACK で伝えて捨てる
+		//
+		// やっていないこと:
+		//   - 再送キューから、ACK されたセグメントを取り除く (未実装。再送キューがまだない。M9)
+		//   - 利用者への "ok" の通知 (省略。Write は積んだ時点で返る)
+		switch {
+		case tcp.SeqLT(c.Snd.NXT, t.Ack):
+			return buildSegment(c.Key.Local, c.Key.Remote, tcp.FlagACK, c.Snd.NXT, c.Rcv.NXT, c.Rcv.WND, nil)
+		case tcp.SeqLT(c.Snd.UNA, t.Ack):
+			c.sndBuf.Next(int(t.Ack - c.Snd.UNA))
+			c.Snd.UNA = t.Ack
+		}
+
+		// 送信ウィンドウの更新。SND.WL1 と SND.WL2 は、最後にウィンドウを更新したセグメントの
+		// SEG.SEQ と SEG.ACK。それより古いセグメントの SEG.WND で上書きしないための条件。
+		// 上で SND.UNA を SEG.ACK まで進めてあるので、ここに来る SEG.ACK は SND.UNA より前か等しい。
+		// SEG.ACK < SND.UNA (古い ACK) は、条件の SND.UNA =< SEG.ACK で外れる
+		if tcp.SeqLE(c.Snd.UNA, t.Ack) &&
+			(tcp.SeqLT(c.Snd.WL1, t.Seq) || (c.Snd.WL1 == t.Seq && tcp.SeqLE(c.Snd.WL2, t.Ack))) {
+			c.Snd.WND = t.Window
+			c.Snd.WL1 = t.Seq
+			c.Snd.WL2 = t.Ack
+		}
 	}
 
 	// RFC 9293 3.10.7.4 Sixth: URG は未実装。扱いを決めていない。
