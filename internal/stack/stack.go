@@ -270,3 +270,6 @@ func (s *Stack) Handle(ip ipv4.Header, t tcp.Header, payload []byte) []byte {
 	// ポートが閉じているとき
 	return buildRST(ip, t, len(payload))
 }
+
+// Read は仮の読み出し口 (T6-2)。
+func (c *Connection) Read(p []byte) int { return 0 }
