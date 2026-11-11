@@ -11,11 +11,77 @@
 
 ## パケットの流れ
 
-```
-tun0 ──Read──▶ ipv4.Parse ──▶ tcp.Parse ──▶ Stack.Handle ──▶ 返信の IP パケット ──Write──▶ tun0
+箱の中の番号は、下の「機能と実装の対応」の行に当たる。
+
+```mermaid
+flowchart LR
+    tun_in["tun0 から読む<br/>(1)"] --> ip["ipv4.Parse<br/>(2)(4)"]
+    ip --> istcp{"TCP か"}
+    istcp -- いいえ --> skip["表示だけして捨てる<br/>(15)"]
+    istcp -- はい --> tcp["tcp.Parse<br/>(5)(4)"]
+    tcp --> stack["Stack.Handle<br/>(8)"]
+    stack --> noconn["接続がない<br/>RST か SYN|ACK<br/>(9)(10)(11)"]
+    stack --> conn["接続がある<br/>Connection.Handle<br/>(12)(13)"]
+    noconn --> build["返信を組み立てる<br/>(3)(6)"]
+    conn --> build
+    build --> tun_out["tun0 に書く<br/>(1)"]
 ```
 
+`Stack.Handle` から先の分岐は、[internal/stack/README.md](../internal/stack/README.md) に図と表がある。
+
 `cmd/tuntcp/main.go` が上の順に呼ぶ。読み取りは別の goroutine（`readLoop`）で行い、チャネルでメインのループに渡す。`Stack` に触るのはメインの goroutine だけなので、ロックは持たない。
+
+## 機能と実装の対応
+
+一番上の粒度の対応表。受信したパケットが通る順に並べてある。1 行が 1 つの機能で、仕様、コードの入口、それを確かめるテストを結ぶ。これより細かい対応（状態と入力ごとの分岐）は、[internal/stack/README.md](../internal/stack/README.md) に書いてある。
+
+状態の意味: **済** は実装とテストがある。**一部** は仕様の一部だけ実装している。**省略** は仕様にあるが意図してやっていない。**未** はこれから実装する。
+
+| # | 機能 | 仕様 | コードの入口 | テスト | 状態 |
+|---|---|---|---|---|---|
+| 1 | TUN デバイスを作り、IP パケットを読み書きする | Linux の TUN/TAP（カーネルの文書 `tuntap`） | `tun.Create`、`cmd/tuntcp` の `readLoop` | 単体テストなし。`task e2e` でパケットが流れることを見る | 済 |
+| 2 | IPv4 ヘッダを読み、長さとチェックサムを検査する | RFC 791 3.1 | `ipv4.Parse` | `TestParseIPv4Header*`、`TestVerifyIPv4Checksum` | 済。フラグメントと IP オプションの解釈は省略 |
+| 3 | IPv4 ヘッダを組み立てる | RFC 791 3.1 | `ipv4.Header.Serialize` | `TestHeader_Serialize*`、`TestHeader_RoundTrip` | 済 |
+| 4 | インターネットチェックサムを計算する | RFC 1071 | `checksum.Sum`、`checksum.Fold` | `TestSum`、`TestFold` | 済 |
+| 5 | TCP ヘッダを読み、疑似ヘッダ込みのチェックサムを検査する | RFC 9293 3.1 | `tcp.Parse` | `TestParseTCPHeader*`、`TestVerifyTCPChecksum` | 済。オプションは切り出すだけで解釈しない（M11） |
+| 6 | TCP ヘッダを組み立てる | RFC 9293 3.1 | `tcp.Header.Serialize` | `TestSerializeTCPHeader*` | 済。オプションは付けない（M11） |
+| 7 | シーケンス番号を modulo 2^32 で比べる | RFC 9293 3.4 | `tcp.SeqLT`、`tcp.SeqLE` | `TestSeqCompare` | 済 |
+| 8 | 受信セグメントを 4-tuple で接続に振り分ける | RFC 9293 3.3.1（TCB）、3.10.7 | `Stack.Handle` | `TestHandle_MultipleConnections`（T4-7 まで失敗） | 済 |
+| 9 | 接続のないセグメントに RST を返す | RFC 9293 3.10.7.1 | `buildRST` | `TestBuildRST*`、`TestHandle_ClosedPort` | 済 |
+| 10 | LISTEN 中のポートで SYN を受け、SYN\|ACK を返して SYN-RECEIVED にする | RFC 9293 3.10.7.2 | `Stack.Handle` | `TestHandle_Listen*`、`task e2e` の検証 | 済。セキュリティの検査は省略 |
+| 11 | 初期シーケンス番号（ISS）を選ぶ | RFC 9293 3.4.1 | `Stack.ISS`、`randomISS` | なし | 一部。下の「仕様と合っていないもの」を参照 |
+| 12 | 接続のあるセグメントを、First〜Eighth の順に処理する | RFC 9293 3.10.7.4 | `Connection.Handle`、`tcp.SegmentAcceptable` | `TestHandle_SynReceived_*`、`TestHandle_Established_*`、`TestSegmentAcceptable` | 一部。下の表を参照 |
+| 13 | LISTEN か CLOSED に戻った接続をテーブルから消す | RFC 9293 3.10.7.4（TCB の削除） | `Stack.Handle` | `TestHandle_SynReceived_NewSYNInWindow_ReturnsToListen` | 済 |
+| 14 | データの送受信、切断、Socket API、再送、フロー制御、MSS | [roadmap.md](roadmap.md) の M6〜M11 | — | — | 未 |
+| 15 | 受信と送信のパケットを画面に表示する | 仕様なし | `cmd/tuntcp` の `display*` | なし | 済 |
+| 16 | 実機で動かし、記録を検証する | [roadmap.md](roadmap.md) の M0 | `scripts/e2e.sh`、`scripts/e2e-check.sh` | 記録を差し替えて、落ちるべきときに落ちることを確かめた | 済 |
+
+12 の内訳。RFC 9293 3.10.7.4 の 8 つの段階ごとの状態。
+
+| 段階 | 内容 | 状態 |
+|---|---|---|
+| First | シーケンス番号の検査 | 済。RCV.WND が 0 のときの例外と、はみ出た部分の切り落としは未 |
+| Second | RST | 未（T4-4） |
+| Third | セキュリティ | 省略 |
+| Fourth | SYN | 一部。SYN-RECEIVED で LISTEN に戻る処理だけ。同期済みの状態での扱い（RFC 5961 の challenge ACK）は目標のあと |
+| Fifth | ACK | 一部。SYN-RECEIVED から ESTABLISHED への遷移だけ。ACK の範囲の検査は未（T4-6）、ESTABLISHED での処理は未（T6-6） |
+| Sixth | URG | 未。扱いを決めていない |
+| Seventh | データ | 未（T4-7、T6-2） |
+| Eighth | FIN | 未（T7-3） |
+
+### 仕様と合っていないもの
+
+- **ISS の選び方**: RFC 9293 3.4.1 は、時計に基づいて選ぶこと（MUST-8）と、`ISN = M + F(4-tuple, 秘密の鍵)` の形にすること（SHLD-1）を求めている。いまの `randomISS` は、毎回ただの乱数を返す。意図して外したのか、直すのかを決めていない
+
+### 仕様と文書から説明できないもの
+
+減らしていく対象。直すか、理由を書くかのどちらかにする。
+
+- `defaultWndSize = 65535`: なぜこの値かが、どこにも書いていない。受信バッファと結びついていない（M10 で直る）
+- `buildSegment` の `TotalLen: 40`: ペイロードがない前提の固定値（T6-1 で直る）
+- `Stack.Handle` の `// TODO: セキュリティ情報が...`: 省略と決めたのか、未実装なのかが書いていない
+- `cmd/tuntcp` が、送る前の返信をもう一度パースしている: 表示のためだけの処理で、TCP のパースのエラーを捨てている
+- どのテストも通らない行: `randomISS` の中身（テストは `Stack.ISS` を差し替えるため）
 
 ## パッケージ
 
@@ -25,7 +91,7 @@ tun0 ──Read──▶ ipv4.Parse ──▶ tcp.Parse ──▶ Stack.Handle �
 | `internal/checksum` | インターネットチェックサム（`Sum` / `Fold`） |
 | `internal/ipv4` | IPv4 ヘッダの `Parse` / `Serialize` とチェックサムの検証 |
 | `internal/tcp` | TCP ヘッダの `Parse` / `Serialize`、フラグ、シーケンス番号の比較、状態（`State`）、TCB（`ControlBlock`） |
-| `internal/stack` | 接続の管理と、受信セグメントの処理 |
+| `internal/stack` | 接続の管理と、受信セグメントの処理。分岐ごとの図と表は [README](../internal/stack/README.md) |
 | `cmd/tuntcp` | エントリポイント。TUN を開き、80 番を LISTEN し、パケットを表示しながら `Stack` に渡す |
 
 ## internal/stack
