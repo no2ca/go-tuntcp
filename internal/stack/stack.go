@@ -1,6 +1,7 @@
 package stack
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"go-tuntcp/internal/ipv4"
@@ -92,6 +93,10 @@ type connKey struct {
 type Connection struct {
 	Key connKey
 	tcp.ControlBlock
+
+	// rcvBuf は、受け取ったが利用者がまだ読んでいないデータ。RCV.NXT の直前までが入っている。
+	// 大きさは制限しておらず、RCV.WND とも結びついていない (M10 で上限を設け、空きから RCV.WND を決める)
+	rcvBuf bytes.Buffer
 }
 
 func (c *Connection) Handle(t tcp.Header, payload []byte) []byte {
@@ -169,7 +174,7 @@ func (c *Connection) Handle(t tcp.Header, payload []byte) []byte {
 	// RFC 9293 3.10.7.4 Sixth: URG は未実装。扱いを決めていない。
 
 	// RFC 9293 3.10.7.4 Seventh: データ。
-	// 受け取った分だけ RCV.NXT を進め、<SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK> で相手に伝える。
+	// 受け取ったデータを受信バッファに移し、その分だけ RCV.NXT を進め、<SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK> で相手に伝える。
 	// データのない ACK には返信しない。返すと ACK 同士の応酬になる。
 	//
 	// RCV.NXT から始まらないデータ (先に届いた後ろのデータ、RCV.NXT をまたぐデータ) は、
@@ -177,7 +182,6 @@ func (c *Connection) Handle(t tcp.Header, payload []byte) []byte {
 	// 捨てた案: またぐデータの新しい部分だけを受け取る。再送は減るが、切り落としの境界の分岐が増える。
 	//
 	// やっていないこと:
-	//   - データの保存 (未実装。T6-2)。いまは ACK だけ返してデータを捨てている
 	//   - 先に届いた後ろのデータを取っておく (SHLD-31。意図して省いた)
 	//   - またぐデータの新しい部分だけを処理する (First の冒頭の要求。意図して省いた)
 	//   - ウィンドウの右端を越えた分の切り落とし (未実装。ウィンドウを 65535 で固定している間は、
@@ -185,6 +189,7 @@ func (c *Connection) Handle(t tcp.Header, payload []byte) []byte {
 	//   - ACK を遅らせて送信データに相乗りさせる (未実装)
 	if c.State == tcp.StateEstablished && len(payload) > 0 {
 		if t.Seq == c.Rcv.NXT {
+			c.rcvBuf.Write(payload)
 			c.Rcv.NXT += uint32(len(payload))
 		}
 		return buildSegment(c.Key.Local, c.Key.Remote, tcp.FlagACK, c.Snd.NXT, c.Rcv.NXT, c.Rcv.WND, nil)
@@ -271,5 +276,12 @@ func (s *Stack) Handle(ip ipv4.Header, t tcp.Header, payload []byte) []byte {
 	return buildRST(ip, t, len(payload))
 }
 
-// Read は仮の読み出し口 (T6-2)。
-func (c *Connection) Read(p []byte) int { return 0 }
+// Read は、受信バッファに貯まったデータを p に移し、移したバイト数を返す。
+// 貯まっていなければ待たずに 0 を返す。
+//
+// 仮の読み出し口。T6-7 のデモで main が呼ぶ。M8 で net.Conn の Read (データが来るまで
+// ブロックする) に置き換える。
+func (c *Connection) Read(p []byte) int {
+	n, _ := c.rcvBuf.Read(p)
+	return n
+}
