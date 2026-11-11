@@ -19,7 +19,8 @@ docs/               ロードマップと設計
 
 - [docs/roadmap.md](docs/roadmap.md): 目標、マイルストーン、タスク、現在の状態
 - [docs/design.md](docs/design.md): パッケージの構成、パケットの流れ、設計の決まりごと
-- [CLAUDE.md](CLAUDE.md): 開発の進め方。実装は AI が主導し、人間はタスクを選び、差分を読んでコミットします
+- [docs/verification-log.md](docs/verification-log.md): 検証の方針がうまくいっているかの記録
+- [CLAUDE.md](CLAUDE.md): 開発の進め方。実装は AI が主導し、人間はタスクを選び、意図と証拠を確かめてコミットします
 
 ## 環境
 
