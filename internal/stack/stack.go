@@ -18,13 +18,7 @@ func buildRST(ip ipv4.Header, t tcp.Header, payloadLen int) []byte {
 		return nil
 	}
 
-	segLen := uint32(payloadLen)
-	if t.HasFlag(tcp.FlagSYN) {
-		segLen++
-	}
-	if t.HasFlag(tcp.FlagFIN) {
-		segLen++
-	}
+	segLen := segmentLength(t, payloadLen)
 
 	var seq, ack uint32
 	var flags tcp.Flag
@@ -46,6 +40,19 @@ func buildRST(ip ipv4.Header, t tcp.Header, payloadLen int) []byte {
 	seg := buildSegment(local, remote, flags, seq, ack, wnd, nil)
 
 	return seg
+}
+
+// segmentLength は SEG.LEN を返す。SYN と FIN は、データを運ばなくても
+// シーケンス番号を 1 つずつ使う (RFC 9293 3.4)。
+func segmentLength(t tcp.Header, payloadLen int) uint32 {
+	n := uint32(payloadLen)
+	if t.HasFlag(tcp.FlagSYN) {
+		n++
+	}
+	if t.HasFlag(tcp.FlagFIN) {
+		n++
+	}
+	return n
 }
 
 func buildSegment(local, remote netip.AddrPort, flags tcp.Flag, seq, ack uint32, wnd uint16, payload []byte) []byte {
@@ -87,7 +94,20 @@ type Connection struct {
 }
 
 func (c *Connection) Handle(t tcp.Header, payload []byte) []byte {
-	// 1: Sequence Number
+	// RFC 9293 3.10.7.4 First: シーケンス番号の検査。
+	// 受理できないセグメントは、相手にいまの RCV.NXT を教え直す ACK を返して捨てる。
+	// 相手が古い状態のまま再送を続けているとき、この ACK で同期し直せる。
+	// RST には返信しない。返すと、RST 同士の応酬になりうる。
+	//
+	// やっていないこと:
+	//   - RCV.WND が 0 のときも、正しい ACK、URG、RST は受け付ける (未実装。M10 でゼロウィンドウを扱うときに決める)
+	//   - 受理したセグメントのうち、ウィンドウの外にはみ出た部分を切り落とす (未実装。T4-7 で扱いを決める)
+	if !tcp.SegmentAcceptable(t.Seq, segmentLength(t, len(payload)), c.Rcv.NXT, c.Rcv.WND) {
+		if t.HasFlag(tcp.FlagRST) {
+			return nil
+		}
+		return buildSegment(c.Key.Local, c.Key.Remote, tcp.FlagACK, c.Snd.NXT, c.Rcv.NXT, c.Rcv.WND, nil)
+	}
 
 	// 2: RST
 

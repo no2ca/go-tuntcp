@@ -14,5 +14,20 @@ func SeqLE(a, b uint32) bool { return int32(a-b) <= 0 }
 //
 // segLen は SEG.LEN。SYN と FIN もそれぞれ 1 と数える (RFC 9293 3.4)。
 func SegmentAcceptable(seq, segLen, rcvNXT uint32, rcvWND uint16) bool {
-	return true // 未実装: すべて受理する
+	wnd := uint32(rcvWND)
+	inWindow := func(x uint32) bool {
+		return SeqLE(rcvNXT, x) && SeqLT(x, rcvNXT+wnd)
+	}
+	switch {
+	case segLen == 0 && wnd == 0:
+		return seq == rcvNXT
+	case segLen == 0:
+		return inWindow(seq)
+	case wnd == 0:
+		return false
+	default:
+		// 先頭か末尾のどちらかがウィンドウに入っていれば受理する。
+		// ウィンドウより前から始まり、後ろまで覆うセグメントは、表のとおり受理しない
+		return inWindow(seq) || inWindow(seq+segLen-1)
+	}
 }
