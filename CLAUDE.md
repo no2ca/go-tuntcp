@@ -19,10 +19,11 @@ TUN デバイスの上に、Go でユーザー空間の TCP プロトコルス�
 task test                                   # go test ./...
 go test ./internal/stack -run TestHandle_X  # テストを 1 つだけ実行
 go vet ./...
-task e2e                                    # ビルド・起動・IP 割り当て・curl（sudo が必要）
+task e2e                                    # ビルド・起動・IP 割り当て・curl（sudo 不要）
 ```
 
-- この環境の `sudo` はパスワードを聞くので、AI のセッションからは `task e2e` を実行できない。ロードマップの T0-1（`unshare -Urn` で sudo なしにする）が終わるまでは、実機確認を人間に依頼する
+- `task e2e` は `unshare` で作った名前空間の中で動くので、AI のセッションからそのまま実行できる。この環境の `sudo` はパスワードを聞くので、`sudo` が要る手順（`task setup-interface` など）は AI からは実行できない
+- `curl` はまだレスポンスを受け取れないので、`task e2e` は 5 秒のタイムアウトで終わる（M6 まで）
 - `tcpdump` と `stringer` は PATH にない。`tcp.State` に状態を足したら `internal/tcp/state_string.go` の再生成が必要になる
 
 ## 1 タスクの進め方

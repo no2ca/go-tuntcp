@@ -25,9 +25,10 @@ tasks:
       - task: setup-interface
       - task: curl
   e2e:
-    desc: ビルド・起動・IP 割り当て・curl を 1 つのターミナルで実行する
+    desc: ビルド・起動・IP 割り当て・curl を 1 つのターミナルで実行する (sudo 不要)
     env:
       TUN_NAME: '{{.TUN_NAME}}'
+      TUN_IP: '{{.TUN_IP}}'
       TUN_PEER_IP: '{{.TUN_PEER_IP}}'
     cmds:
       - ./scripts/e2e.sh
