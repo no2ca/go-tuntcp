@@ -503,6 +503,22 @@ func TestHandle_Established_ZeroWindow(t *testing.T) {
 	}
 }
 
+func TestHandle_Established_RSTOutOfWindow_Ignored(t *testing.T) {
+	// First: 受理できないセグメントに RST が立っていたら、ACK を返さずに捨てる。接続は壊さない。
+	// ウィンドウの外の RST で接続を切れると、SEQ を当てなくても第三者が接続を切れてしまう。
+	s := newTestStack()
+	c := establish(t, s)
+
+	outOfWindow := c.Rcv.NXT + uint32(c.Rcv.WND) + 1000
+	if reply := s.Handle(incomingIP(), incomingTCP(tcp.FlagRST, outOfWindow, 0), nil); reply != nil {
+		t.Errorf("reply = %x, want nil", reply)
+	}
+	if _, ok := s.conns[testKey()]; !ok {
+		t.Error("connection removed by an out-of-window RST")
+	}
+	checkState(t, c, tcp.StateEstablished)
+}
+
 func TestHandle_Established_RST_Closes(t *testing.T) {
 	s := newTestStack()
 	establish(t, s)
