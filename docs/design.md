@@ -17,19 +17,27 @@
 flowchart LR
     tun_in["tun0 から読む<br/>(1)"] --> ip["ipv4.Parse<br/>(2)(4)"]
     ip --> istcp{"TCP か"}
-    istcp -- いいえ --> skip["表示だけして捨てる<br/>(15)"]
+    istcp -- いいえ --> skip["表示だけして捨てる<br/>(19)"]
     istcp -- はい --> tcp["tcp.Parse<br/>(5)(4)"]
     tcp --> stack["Stack.Handle<br/>(8)"]
     stack --> noconn["接続がない<br/>RST か SYN|ACK<br/>(9)(10)(11)"]
     stack --> conn["接続がある<br/>Connection.Handle<br/>(12)(13)"]
     noconn --> build["返信を組み立てる<br/>(3)(6)"]
     conn --> build
+    conn --> rcvbuf["受信バッファ<br/>(14)"]
+    rcvbuf --> demo["仮のデモ<br/>Read / Write<br/>(17)"]
+    demo --> sndbuf["送信バッファ<br/>(15)"]
+    conn --> sndbuf
+    sndbuf --> queue["送信キュー<br/>TakeOutgoing<br/>(16)"]
     build --> tun_out["tun0 に書く<br/>(1)"]
+    queue --> tun_out
 ```
+
+送るパケットの出口は 2 つある。受信への直接の返信（ACK、RST、SYN|ACK）は `Stack.Handle` の戻り値で、データのように受信を待たずに送るものは送信キューから出る。`main` は 1 つのセグメントを処理するたびに、戻り値、送信キューの順に TUN に書く。
 
 `Stack.Handle` から先の分岐は、[internal/stack/README.md](../internal/stack/README.md) に図と表がある。
 
-`cmd/tuntcp/main.go` が上の順に呼ぶ。読み取りは別の goroutine（`readLoop`）で行い、チャネルでメインのループに渡す。`Stack` に触るのはメインの goroutine だけなので、ロックは持たない。
+`cmd/tuntcp/main.go` が上の順に呼ぶ。`Stack.Handle` のあと、仮のデモ（`demoServer`）が受信バッファを読み、HTTP リクエストの終わりが届いていれば決まったレスポンスを書く。読み取りは別の goroutine（`readLoop`）で行い、チャネルでメインのループに渡す。`Stack` に触るのはメインの goroutine だけなので、ロックは持たない。
 
 ## 機能と実装の対応
 
@@ -52,9 +60,13 @@ flowchart LR
 | 11 | 初期シーケンス番号（ISS）を選ぶ | RFC 9293 3.4.1 | `Stack.ISS`、`randomISS` | なし | 一部。下の「仕様と合っていないもの」を参照 |
 | 12 | 接続のあるセグメントを、First〜Eighth の順に処理する | RFC 9293 3.10.7.4 | `Connection.Handle`、`tcp.SegmentAcceptable` | `TestHandle_SynReceived_*`、`TestHandle_Established_*`、`TestSegmentAcceptable` | 一部。下の表を参照 |
 | 13 | LISTEN か CLOSED に戻った接続をテーブルから消す | RFC 9293 3.10.7.4（TCB の削除） | `Stack.Handle` | `TestHandle_SynReceived_NewSYNInWindow_ReturnsToListen` | 済 |
-| 14 | データの送受信、切断、Socket API、再送、フロー制御、MSS | [roadmap.md](roadmap.md) の M6〜M11 | — | — | 未 |
-| 15 | 受信と送信のパケットを画面に表示する | 仕様なし | `cmd/tuntcp` の `display*` | なし | 済 |
-| 16 | 実機で動かし、記録を検証する | [roadmap.md](roadmap.md) の M0 | `scripts/e2e.sh`、`scripts/e2e-check.sh` | 記録を差し替えて、落ちるべきときに落ちることを確かめた | 済 |
+| 14 | 受け取ったデータを受信バッファに貯め、利用者が読み出す | RFC 9293 3.10.7.4 Seventh、3.10.3 | `Connection.Read`（仮の口） | `TestRead_*` | 一部。上限と広告ウィンドウとの結びつきは未（M10） |
+| 15 | 利用者が書いたデータを送信バッファに積み、ウィンドウと MSS に収まる分を切り出して送る | RFC 9293 3.10.2、3.9.1.2（PSH）、3.7.1（MSS 536） | `Connection.Write`（仮の口）、`Connection.output` | `TestWrite_*`、`TestHandle_Established_ACK_SendsRemainingData` | 一部。再送（M9）、probe と Nagle（M10）、MSS の交換（M11）は未 |
+| 16 | 受信を待たずに送るパケットを送信キューに積み、`main` が取り出して TUN に書く | 仕様なし（「対話で決めた仕様」） | `Stack.TakeOutgoing` | `TestWrite_*`（`takeSent` で取り出す） | 済 |
+| 17 | HTTP リクエストに固定のレスポンスを返す仮のデモ | 仕様なし（M8 で捨てる） | `cmd/tuntcp` の `demoServer`、`Stack.Conn` | `task e2e` の検証（本文の一致、レスポンスへの ACK） | 済 |
+| 18 | 切断、Socket API、再送、フロー制御、MSS | [roadmap.md](roadmap.md) の M7〜M11 | — | — | 未 |
+| 19 | 受信と送信のパケットを画面に表示する | 仕様なし | `cmd/tuntcp` の `display*` | なし | 済 |
+| 20 | 実機で動かし、記録を検証する | [roadmap.md](roadmap.md) の M0 | `scripts/e2e.sh`、`scripts/e2e-check.sh` | 記録を差し替えて、落ちるべきときに落ちることを確かめた | 済 |
 
 12 の内訳。RFC 9293 3.10.7.4 の 8 つの段階ごとの状態。
 
@@ -64,9 +76,9 @@ flowchart LR
 | Second | RST | 済。SYN-RECEIVED は LISTEN に、ESTABLISHED は CLOSED にする。RFC 5961 の challenge ACK は目標のあと。利用者への通知は未（M8） |
 | Third | セキュリティ | 省略 |
 | Fourth | SYN | 一部。SYN-RECEIVED で LISTEN に戻る処理だけ。同期済みの状態での扱い（RFC 5961 の challenge ACK）は目標のあと |
-| Fifth | ACK | 一部。SYN-RECEIVED での範囲の検査と ESTABLISHED への遷移だけ。ESTABLISHED での処理は未（T6-6） |
+| Fifth | ACK | 一部。SYN-RECEIVED での範囲の検査と ESTABLISHED への遷移、ESTABLISHED での SND.UNA の更新と送信ウィンドウの更新。再送キューからの削除は未（M9）。FIN-WAIT などの状態は未（M7） |
 | Sixth | URG | 未。扱いを決めていない |
-| Seventh | データ | 一部。RCV.NXT から始まるデータの分だけ RCV.NXT を進め、ACK を返す。データの保存は未（T6-2） |
+| Seventh | データ | 一部。RCV.NXT から始まるデータを受信バッファに移して RCV.NXT を進め、ACK を返す。ACK を遅らせて送信データに相乗りさせることは未（扱いを決めていない） |
 | Eighth | FIN | 未（T7-3） |
 
 ### 仕様と合っていないもの
@@ -78,11 +90,10 @@ flowchart LR
 減らしていく対象。直すか、理由を書くかのどちらかにする。
 
 - `defaultWndSize = 65535`: なぜこの値かが、どこにも書いていない。受信バッファと結びついていない（M10 で直る）
-- `buildSegment` の `TotalLen: 40`: ペイロードがない前提の固定値（T6-1 で直る）
 - RST のウィンドウの欄: 接続のあるとき（`Connection.Handle`）は `c.Rcv.WND`、ないとき（`buildRST`）は `defaultWndSize` を入れている。RFC 9293 は RST のウィンドウの値を決めていない。揃っておらず、理由も書いていない
 - `Stack.Handle` の `// TODO: セキュリティ情報が...`: 省略と決めたのか、未実装なのかが書いていない
-- `cmd/tuntcp` が、送る前の返信をもう一度パースしている: 表示のためだけの処理で、TCP のパースのエラーを捨てている
-- どのテストも通らない行: `randomISS` の中身（テストは `Stack.ISS` を差し替えるため）
+- `cmd/tuntcp` が、送ったパケットをもう一度パースしている: 表示のためだけの処理（T6-7 で、パースのエラーを捨てずにログに出すようにした）
+- どのテストも通らない行: `randomISS` の中身（テストは `Stack.ISS` を差し替えるため）、`Stack.Conn`（`main` のデモだけが使う。`task e2e` では通る）
 
 ## パッケージ
 
@@ -93,7 +104,7 @@ flowchart LR
 | `internal/ipv4` | IPv4 ヘッダの `Parse` / `Serialize` とチェックサムの検証 |
 | `internal/tcp` | TCP ヘッダの `Parse` / `Serialize`、フラグ、シーケンス番号の比較、状態（`State`）、TCB（`ControlBlock`） |
 | `internal/stack` | 接続の管理と、受信セグメントの処理。分岐ごとの図と表は [README](../internal/stack/README.md) |
-| `cmd/tuntcp` | エントリポイント。TUN を開き、80 番を LISTEN し、パケットを表示しながら `Stack` に渡す |
+| `cmd/tuntcp` | エントリポイント。TUN を開き、80 番を LISTEN し、パケットを表示しながら `Stack` に渡す。HTTP に固定のレスポンスを返す仮のデモを持つ |
 
 ## internal/stack
 
@@ -103,8 +114,11 @@ flowchart LR
   - テーブルに接続があれば `Connection.Handle` に渡す。処理のあと LISTEN か CLOSED に戻った接続は、テーブルから消す
   - 接続がなく、ポートが LISTEN 中なら RFC 9293 3.10.7.2 に従う。SYN なら `Connection` を作って SYN-RECEIVED にし、SYN|ACK を返す
   - どちらでもなければ RFC 9293 3.10.7.1 に従って RST を返す（`buildRST`）
-- `Connection` は `tcp.ControlBlock`（状態と、SND / RCV のシーケンス変数）を埋め込む
-- `Connection.Handle` は RFC 9293 3.10.7.4 の First〜Eighth の順に並べる。段階ごとの状態は、上の「12 の内訳」の表にある
+- `Connection` は `tcp.ControlBlock`（状態と、SND / RCV のシーケンス変数）を埋め込み、受信バッファと送信バッファ（どちらも `bytes.Buffer`）を持つ
+  - 受信バッファ: 受け取ったが読まれていないデータ。末尾が RCV.NXT の直前に当たる
+  - 送信バッファ: 書かれたが ACK されていないデータ。先頭が SND.UNA に当たり、先頭から SND.NXT - SND.UNA バイトは送信済み
+- `Connection.Handle` は RFC 9293 3.10.7.4 の First〜Eighth の順に並べる。段階ごとの状態は、上の「12 の内訳」の表にある。処理のあと、送れるようになったデータを送る（`output`）
+- `Connection.Write` は送信バッファに積んで `output` を呼ぶ。`output` は SND.NXT から、相手のウィンドウ（SND.UNA + SND.WND の手前）と MSS 536 に収まる分を切り出し、送信キューに積む
 
 ## 決まりごと
 
@@ -118,6 +132,15 @@ flowchart LR
 
 RFC が決めていない、または RFC の推奨から意図して外れた振る舞い。
 
+- **送信の配管と、仮の読み書き口**（2026-11-11、T6-3、T6-4、T6-7。人間が「自走してよい」としたので AI が決めた。**人間の確認待ち**）
+  - 受信への直接の返信（ACK、RST、SYN|ACK）は、いまどおり `Stack.Handle` の戻り値で返す。それ以外（データ）は `Stack` の送信キューに積み、`Stack.TakeOutgoing` で取り出す。`main` は戻り値、送信キューの順に TUN に書く
+  - 捨てた案: すべてを送信キューに通し、`Handle` は何も返さない。出口が 1 つになって分かりやすいが、既存のテスト 40 か所ほどの書き換えになる。M8 のイベントループで入口が変わるので、そのときにまとめて考える
+  - 仮の口は 3 つ: `Connection.Read(p) int`（貯まっている分を移す。なければ待たずに 0）、`Connection.Write(p) error`（積んで送れる分を送る）、`Stack.Conn(local, remote)`（`main` が受信セグメントのアドレスから接続を引く）。どれも M8 で `net.Listener` / `net.Conn` に置き換える
+  - `Write` は SYN-RECEIVED と ESTABLISHED で受け付ける（RFC 9293 3.10.2。SYN-RECEIVED では積むだけ）。それ以外ではエラーを返す。エラーの形は T8-5 で決める
+  - 送るタイミング: `Write` の直後と、受信セグメントを処理した直後。Nagle などで待つことはしない（T10-3）
+  - PSH: 送信バッファの未送信のデータを送り切るセグメントに立てる。SEND の PUSH フラグを実装しないときの RFC 9293 3.9.1.2 MUST-61 に従う
+  - デモ（`demoServer`）: 受信したバイト列に空行（`\r\n\r\n`）が現れたら、`Content-Length` 付きの固定のレスポンスを 1 回書く。リクエストの中身は解釈しない。M8 で捨てる
+
 - **RCV.NXT から始まらないデータは、ACK を返してまるごと捨てる**（2026-11-11、T4-7）
   - 対象は、First の検査では受理できるが SEG.SEQ が RCV.NXT と一致しないデータ。先に届いた後ろのデータ（間が抜けている）と、RCV.NXT をまたぐデータ（前半が受信済み）の 2 種類
   - RCV.NXT は進めず、`<SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>` を返す。相手の再送に任せる
@@ -128,17 +151,18 @@ RFC が決めていない、または RFC の推奨から意図して外れた�
 
 ## いまの制限
 
-- `buildSegment` の IPv4 `TotalLen` が 40 固定で、ペイロードを載せられない
-- 受信したデータは ACK だけ返して捨てている（T6-2 で保存する）
 - 送信するセグメントに TCP オプションを付けない（`DataOffset` は 5 固定）。受信したオプションは読み捨てる
-- `Handle` の戻り値が返信 1 つだけなので、受信をきっかけにしない送信（データの送信、再送）ができない
-- 状態は CLOSED、LISTEN、SYN-SENT、SYN-RECEIVED、ESTABLISHED の 5 つだけ
+- 状態は CLOSED、LISTEN、SYN-SENT、SYN-RECEIVED、ESTABLISHED の 5 つだけ。FIN を受けても何もしない
+- 送ったデータを再送しない。落ちたら接続が止まる（M9）
+- 受信バッファと送信バッファに上限がなく、広告ウィンドウは 65535 のまま（M10）
+- `Read` と `Write` は仮の口で、`Read` は待たずに 0 を返す。`main` の 1 つの goroutine からしか呼べない（M8）
+- データを受けると ACK を返し、そのあとに送るデータは別のセグメントになる（ACK を相乗りさせない）
 
 ## これから変えるところ
 
 マイルストーンが進むと、いまの「受信 1 つに返信 1 つ」の形では足りなくなる。次の順に広げる。
 
-1. **送信キュー（M6）**: `Stack` が送りたいパケットをキューに積み、`main` がそれを TUN に書く。`Handle` の戻り値に頼らずに送れるようにする
+1. **送信キュー（M6、済）**: `Stack` が送りたいパケットをキューに積み、`main` がそれを TUN に書く。`Handle` の戻り値に頼らずに送れるようにした
 2. **時計の注入（M7）**: タイマー（2MSL、再送、persist）のために、時刻を外から渡す。テストでは時間を手で進める
 3. **イベントループ（M8）**: `Stack` を 1 つの goroutine が持ち、受信セグメント、タイマー、API の呼び出しをチャネルで受ける。`net.Listener` と `net.Conn` のメソッドは、このループに要求を送ってブロックする
 

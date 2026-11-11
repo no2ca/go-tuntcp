@@ -202,7 +202,8 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 		// 送ったデータへの ACK を受け、SND.UNA を進め、ACK されたデータを送信バッファから捨てる。
 		// 重複した ACK (SEG.ACK =< SND.UNA) は無視するが、セグメントの処理は続ける
 		// (ウィンドウの更新やデータの受け取りがありうる)。
-		// まだ送っていない範囲への ACK は、相手が混乱しているので、いまの状態を ACK で伝えて捨てる
+		// まだ送っていない範囲への ACK は受け入れようがないので、いまの SND.NXT と RCV.NXT を ACK で伝え、
+		// セグメントごと捨てる (載っているデータも受け取らない)
 		//
 		// やっていないこと:
 		//   - 再送キューから、ACK されたセグメントを取り除く (未実装。再送キューがまだない。M9)
@@ -217,8 +218,9 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 
 		// 送信ウィンドウの更新。SND.WL1 と SND.WL2 は、最後にウィンドウを更新したセグメントの
 		// SEG.SEQ と SEG.ACK。それより古いセグメントの SEG.WND で上書きしないための条件。
-		// 上で SND.UNA を SEG.ACK まで進めてあるので、ここに来る SEG.ACK は SND.UNA より前か等しい。
-		// SEG.ACK < SND.UNA (古い ACK) は、条件の SND.UNA =< SEG.ACK で外れる
+		// 上で SND.UNA を進めたあとなので、ここでは常に SEG.ACK =< SND.UNA。条件の SND.UNA =< SEG.ACK が
+		// 成り立つのは等しいとき (いま SND.UNA が進んだか、新しい ACK を含まないセグメント) だけで、
+		// 古い ACK (SEG.ACK < SND.UNA) は外れる
 		if tcp.SeqLE(c.Snd.UNA, t.Ack) &&
 			(tcp.SeqLT(c.Snd.WL1, t.Seq) || (c.Snd.WL1 == t.Seq && tcp.SeqLE(c.Snd.WL2, t.Ack))) {
 			c.Snd.WND = t.Window
@@ -275,6 +277,14 @@ func randomISS() uint32 {
 	var b [4]byte
 	_, _ = rand.Read(b[:])
 	return binary.BigEndian.Uint32(b[:])
+}
+
+// Conn は、自分と相手のアドレスとポートの組で接続を引く。なければ nil。
+//
+// 仮の口。T6-7 のデモで、main が受信セグメントの宛先と送信元から接続を引き、
+// Connection.Read と Write を呼ぶために使う。M8 で net.Listener の Accept に置き換える。
+func (s *Stack) Conn(local, remote netip.AddrPort) *Connection {
+	return s.conns[connKey{Local: local, Remote: remote}]
 }
 
 func (s *Stack) Listen(port uint16) {

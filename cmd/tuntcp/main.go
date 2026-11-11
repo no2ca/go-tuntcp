@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/netip"
 	"os/signal"
 	"syscall"
 
@@ -33,9 +34,10 @@ func main() {
 
 	ch := make(chan readResult)
 	go readLoop(ctx, ch, dev)
-	
+
 	stk := stack.New()
 	stk.Listen(80)
+	demo := newDemoServer()
 
 	for {
 		select {
@@ -63,29 +65,82 @@ func main() {
 			}
 			displayTCP(t)
 
-			reply := stk.Handle(ip, t, tcpPayload)
-			if reply == nil {
-				continue
+			// 受信への直接の返信を先に送り、そのあと送信キューに積まれたもの (データなど) を送る
+			if reply := stk.Handle(ip, t, tcpPayload); reply != nil {
+				send(dev, reply)
 			}
-
-			repIP, repIPPayload, err := ipv4.Parse(reply)
-			if err != nil {
-				log.Printf("parse reply: %v", err)
-				continue
+			local := netip.AddrPortFrom(ip.Dst, t.DstPort)
+			remote := netip.AddrPortFrom(ip.Src, t.SrcPort)
+			if c := stk.Conn(local, remote); c != nil {
+				demo.serve(c)
 			}
-
-			repTCP, _, _, err := tcp.Parse(ip.Src.As4(), ip.Dst.As4(), repIPPayload)
-
-			if _, err := dev.Write(reply); err != nil {
-				log.Printf("write: %v", err)
-				continue
+			for _, pkt := range stk.TakeOutgoing() {
+				send(dev, pkt)
 			}
-
-			displayRawTx(reply)
-			displayIPv4(repIP)
-			displayTCP(repTCP)
 		}
 	}
+}
+
+// demoServer は、HTTP リクエストを受け取ったら決まったレスポンスを返す仮のデモ (T6-7)。
+// リクエストの中身は解釈せず、ヘッダの終わり (空行) が届いたら 1 回返す。本文のあるリクエストは扱わない。
+// M8 で net.Listener と net.Conn ができたら、http.Serve に置き換えて捨てる (T8-8)。
+type demoServer struct {
+	pending map[*stack.Connection][]byte // 接続ごとの、まだ応答していないリクエストの断片
+}
+
+// demoBody は scripts/e2e-check.sh が curl の受け取った本文と比べる。変えるときは両方を直す
+const demoBody = "hello from go-tuntcp\n"
+
+var demoResponse = []byte("HTTP/1.1 200 OK\r\n" +
+	"Content-Type: text/plain\r\n" +
+	fmt.Sprintf("Content-Length: %d\r\n", len(demoBody)) +
+	"\r\n" +
+	demoBody)
+
+func newDemoServer() *demoServer {
+	return &demoServer{pending: make(map[*stack.Connection][]byte)}
+}
+
+func (d *demoServer) serve(c *stack.Connection) {
+	buf := make([]byte, 1500)
+	for {
+		n := c.Read(buf)
+		if n == 0 {
+			break
+		}
+		d.pending[c] = append(d.pending[c], buf[:n]...)
+	}
+	req := d.pending[c]
+	end := bytes.Index(req, []byte("\r\n\r\n"))
+	if end < 0 {
+		return
+	}
+	d.pending[c] = req[end+4:]
+	if err := c.Write(demoResponse); err != nil {
+		log.Printf("demo: write: %v", err)
+	}
+}
+
+func send(dev io.Writer, pkt []byte) {
+	if _, err := dev.Write(pkt); err != nil {
+		log.Printf("write: %v", err)
+		return
+	}
+	displayRawTx(pkt)
+
+	// 以下は表示のためだけに、送ったパケットをもう一度パースする
+	ip, ipPayload, err := ipv4.Parse(pkt)
+	if err != nil {
+		log.Printf("parse sent ipv4: %v", err)
+		return
+	}
+	displayIPv4(ip)
+	t, _, _, err := tcp.Parse(ip.Src.As4(), ip.Dst.As4(), ipPayload)
+	if err != nil {
+		log.Printf("parse sent tcp: %v", err)
+		return
+	}
+	displayTCP(t)
 }
 
 type readResult struct {

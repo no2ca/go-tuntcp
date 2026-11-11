@@ -31,11 +31,11 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
 
 ## 現在の状態（2026-11-11）
 
-- M0〜5（実機確認の自動化、TUN、IPv4、TCP ヘッダ、状態機械と 3-way handshake）は完了。次は M6 の T6-1
-- handshake のあと、`curl` の HTTP リクエストに ACK を返せる。RST を受けたら接続を消す。受け取ったデータはまだ保存せずに捨てている（T6-2）
+- M0〜6（実機確認の自動化、TUN、IPv4、TCP ヘッダ、handshake、データの送受信）は完了。次は M7 の T7-1
+- `curl` が仮のデモ（`cmd/tuntcp` の `demoServer`）から固定の HTTP レスポンスを受け取り、終了コード 0 で終わる
+- FIN はまだ扱わない（T7-3）。`curl` が閉じたあと、カーネルは FIN を再送し続け、`ss -tn` には `FIN-WAIT-1` が残る
 - `task test` はすべて通る
-- `task e2e` は sudo なしで動き、tcpdump の記録から 3-way handshake の成立、データへの ACK、`ss -tn` の `ESTAB` を検証して終了コードで返す
-- `curl` 自体はまだレスポンスを受け取れず、5 秒でタイムアウトする。`task e2e` はこれを失敗として扱っていない（T6-7 で検証に足す）
+- `task e2e` は sudo なしで動き、handshake、データへの ACK、`ss -tn` の確立、レスポンスへの ACK、`curl` が受け取った本文を検証して終了コードで返す
 
 ## 完了したマイルストーン
 
@@ -53,32 +53,21 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
   - `task e2e` が、handshake の成立、データへの ACK、`curl` の最中の `ss -tn` の `ESTAB` を検証する
   - 後回しにしたもの: RFC 5961 の challenge ACK（目標のあと）、RCV.WND が 0 のときの例外（M10）、URG（扱いを決めていない）
 
+- [x] **M6** データの送受信（T6-1〜T6-7）
+  - 受信: RCV.NXT から始まるデータを受信バッファに貯め、`Connection.Read`（仮の口）で読み出す
+  - 送信: `Connection.Write`（仮の口）で送信バッファに積み、SND.NXT から相手のウィンドウと MSS 536 に収まる分を切り出して送る。受信を待たずに送るパケットは `Stack.TakeOutgoing` の送信キューから出す
+  - ESTABLISHED での ACK（Fifth）: SND.UNA を進めて送信バッファから捨て、SND.WL1 / SND.WL2 の条件で送信ウィンドウを更新する
+  - `task e2e` が、`curl` の受け取った本文と、レスポンスへの ACK を検証する
+  - AI が決めた仕様（送信キューの形、仮の読み書き口）は [design.md](design.md) の「対話で決めた仕様」にあり、人間の確認待ち
+  - 後回しにしたもの: 受信バッファと送信バッファの上限、広告ウィンドウを空きから決めること（M10）、ACK を遅らせてデータに相乗りさせること（決めていない）
+
 ---
-
-## M6: データの送受信
-
-完了条件: `task e2e` で、`curl` が固定の HTTP レスポンスを受け取る
-
-- [ ] **T6-1** ペイロード付きセグメントの組み立て
-  - `buildSegment` の IPv4 `TotalLen` が 40 固定なので、ペイロード長から計算する
-- [ ] **T6-2** 受信バッファ
-  - 受理したデータを貯め、アプリ側が読み出せる型。T4-7 から呼ぶ
-  - この時点では大きさを制限せず、広告ウィンドウも固定のままにする（M10 で直す）
-- [ ] **T6-3** 送信の配管
-  - いまは `Handle` の戻り値でしか送れない。受信を待たずに送れるよう、`Stack` から TUN への送信キューを作る（[design.md](design.md) の「これから変えるところ」の 1）
-- [ ] **T6-4** 送信バッファと、`Connection` への仮の書き込み口
-- [ ] **T6-5** 送信バッファからセグメントを切り出して送る
-  - SND.NXT から、相手のウィンドウ（`SND.UNA + SND.WND` まで）と MSS（当面 536 固定）に収まる分だけ送り、SND.NXT を進める
-- [ ] **T6-6** ESTABLISHED での ACK の処理（Fifth）
-  - `SND.UNA < SEG.ACK =< SND.NXT` なら SND.UNA を進める。重複した ACK は無視し、まだ送っていない範囲への ACK には ACK を返して捨てる
-  - 送信ウィンドウを更新する（SND.WL1 と SND.WL2 を使う条件）
-- [ ] **T6-7** 固定の HTTP レスポンスを返す仮のデモと、`task e2e` の検証
-  - リクエストを受け取ったら決まったレスポンスを送る処理を `main` に直接書く。M8 で API ができたら捨てる
-  - `curl` がレスポンスを受け取ることを `scripts/e2e-check.sh` に足す
 
 ## M7: 切断
 
 完了条件: `task e2e` で `curl` が終了コード 0 で終わり、そのあと `ss -tn` に接続が残らない
+
+- 終了コード 0 は M6 の時点ですでに満たしている（`curl` は Content-Length の分を受け取ると、FIN の返事を待たずに終わる）。残るのは接続の後始末
 
 - [ ] **T7-1** 状態の追加（FIN-WAIT-1, FIN-WAIT-2, CLOSING, TIME-WAIT, CLOSE-WAIT, LAST-ACK）と stringer の再生成
 - [ ] **T7-2** 時刻の注入とタイマーの基盤
@@ -92,6 +81,7 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
 - [ ] **T7-5** TIME-WAIT の 2MSL タイマー
 - [ ] **T7-6** 異常時に RST を送って接続を捨てる（Abort）
 - [ ] **T7-7** 仮のデモでレスポンスのあとに閉じ、`task e2e` の検証に `curl` の終了コードと接続の後始末を足す
+  - 終了コードは `tmp/e2e/curl.exit` に記録済み（T6-7）。検証にはまだ入れていない
 
 ## M8: Socket API（サーバ側）
 

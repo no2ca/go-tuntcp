@@ -34,8 +34,7 @@ task e2e                                    # ビルド・起動・IP 割り当�
 ```
 
 - `task e2e` は `unshare` で作った名前空間の中で動くので、AI のセッションからそのまま実行できる。この環境の `sudo` はパスワードを聞くので、`sudo` が要る手順（`task setup-interface` など）は AI からは実行できない
-- `curl` はまだレスポンスを受け取れないので、`task e2e` は 5 秒のタイムアウトを待つ（T6-7 まで）。これは失敗として扱っていない
-- `task e2e` は流れたパケットを `tmp/e2e/tcpdump.txt` に、`curl` の最中の `ss -tn` を `tmp/e2e/ss.txt` に、自作スタックの出力を `tmp/e2e/stack.log` に残す。実機での振る舞いは tcpdump の記録で確かめる
+- `task e2e` は流れたパケットを `tmp/e2e/tcpdump.txt` に、`curl` の最中の `ss -tn` を `tmp/e2e/ss.txt` に、自作スタックの出力を `tmp/e2e/stack.log` に、`curl` の本文と終了コードを `tmp/e2e/curl.txt` と `tmp/e2e/curl.exit` に残す。実機での振る舞いは tcpdump の記録で確かめる
 - `task e2e` の最後に `scripts/e2e-check.sh` が記録を検証し、満たさない項目があれば 0 以外で終わる。実機での完了条件があるタスクでは、その確認をこのスクリプトに足す
 - `stringer` は PATH にない。`tcp.State` に状態を足したら `internal/tcp/state_string.go` の再生成が必要になる
 

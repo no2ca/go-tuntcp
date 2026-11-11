@@ -22,7 +22,7 @@ fi
 mkdir -p "$OUT"
 # 前回の記録を消す。残っていると、下の「tcpdump がキャプチャを始めるまで待つ」が
 # 前回の tcpdump.err を見てすぐ抜けてしまい、handshake を取りこぼす
-rm -f "$OUT"/tcpdump.txt "$OUT"/tcpdump.err "$OUT"/stack.log "$OUT"/ss.txt
+rm -f "$OUT"/tcpdump.txt "$OUT"/tcpdump.err "$OUT"/stack.log "$OUT"/ss.txt "$OUT"/curl.*
 ip link set lo up
 
 pids=()
@@ -50,8 +50,10 @@ ip addr add "$TUN_IP" peer "$TUN_PEER_IP" dev "$TUN_NAME"
 ip link set "$TUN_NAME" up
 
 # 実際に流れたパケットを tcpdump で記録する。1 セグメントが 1 行になる。
-# 名前空間の中では権限を落とす先のユーザーがいないが、-Z を付けなくても動く
-tcpdump -i "$TUN_NAME" -n -l -ttt tcp >"$OUT/tcpdump.txt" 2>"$OUT/tcpdump.err" &
+# 名前空間の中では権限を落とす先のユーザーがいないが、-Z を付けなくても動く。
+# --immediate-mode は、カーネルから届いたパケットを溜めずにすぐ渡させる。付けないと、
+# curl が数ミリ秒で終わったとき、溜まっていたパケットを書き出す前に下で止めてしまい、記録が空になる
+tcpdump -i "$TUN_NAME" -n -l -ttt --immediate-mode tcp >"$OUT/tcpdump.txt" 2>"$OUT/tcpdump.err" &
 dump=$!
 pids+=("$dump")
 
@@ -68,15 +70,20 @@ done
 # curl を裏で走らせ、その最中のカーネル側のソケットの状態を ss で記録する。
 # -t は TCP だけ、-n は名前を引かずに番号で表示する。
 # handshake は 1 ミリ秒ほどで終わるが、curl の起動を待つ必要があるので、
-# ESTAB が出るまで 0.1 秒おきに最大 3 秒見る。出なければ、最後に見た状態が残る
-curl -sS -m 5 "$TUN_PEER_IP" &
+# 確立したあとの状態 (ESTAB か、curl が閉じたあとの FIN-WAIT-1 など) が出るまで 0.1 秒おきに最大 3 秒見る。
+# 出なければ、最後に見た状態 (SYN-SENT など) が残る。
+# curl はレスポンスを受け取るとすぐ閉じるので、記録に残るのは ESTAB とは限らない (e2e-check.sh の ss_estab)
+# 受け取った本文は curl.txt、エラーは curl.err、終了コードは curl.exit に残す
+curl -sS -m 5 -o "$OUT/curl.txt" "$TUN_PEER_IP" 2>"$OUT/curl.err" &
 curl_pid=$!
 for _ in $(seq 30); do
   ss -tn >"$OUT/ss.txt"
-  if grep -q '^ESTAB' "$OUT/ss.txt"; then break; fi
+  if grep -Eq '^(ESTAB|FIN-WAIT-1|FIN-WAIT-2|CLOSING|TIME-WAIT) ' "$OUT/ss.txt"; then break; fi
   sleep 0.1
 done
-wait "$curl_pid" || true
+curl_exit=0
+wait "$curl_pid" || curl_exit=$?
+echo "$curl_exit" >"$OUT/curl.exit"
 
 # tcpdump を止めて出力を書き切らせてから表示する
 kill -INT "$dump" 2>/dev/null || true
@@ -86,5 +93,8 @@ echo "--- tcpdump ($OUT/tcpdump.txt) ---"
 cat "$OUT/tcpdump.txt"
 echo "--- ss -tn ($OUT/ss.txt) ---"
 cat "$OUT/ss.txt"
+echo "--- curl (終了コード $curl_exit、本文 $OUT/curl.txt) ---"
+cat "$OUT/curl.txt" 2>/dev/null || true
+cat "$OUT/curl.err"
 
 ./scripts/e2e-check.sh "$OUT"
