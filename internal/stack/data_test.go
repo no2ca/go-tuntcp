@@ -139,3 +139,242 @@ func TestRead_ClientSeqWrapsAround(t *testing.T) {
 		t.Errorf("Read = %q, want %q", got, "hello!")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// T6-3〜T6-5: 送信キュー、送信バッファ、セグメントの切り出し
+// (RFC 9293 3.10.2 SEND Call、3.9.1.2、3.7.1)
+// ---------------------------------------------------------------------------
+
+type sentSegment struct {
+	hdr     tcp.Header
+	payload []byte
+}
+
+// takeSent は、送信キューに積まれたパケットをすべて取り出してパースする。
+func takeSent(t *testing.T, s *Stack) []sentSegment {
+	t.Helper()
+	var out []sentSegment
+	for _, pkt := range s.TakeOutgoing() {
+		th, payload := mustReply(t, pkt)
+		out = append(out, sentSegment{th, payload})
+	}
+	return out
+}
+
+// establishWithWindow は handshake を完了させる。最後の ACK で相手の受信ウィンドウを wnd と広告する。
+func establishWithWindow(t *testing.T, s *Stack, wnd uint16) *Connection {
+	t.Helper()
+	c := sendSYN(t, s)
+	ack := incomingTCP(tcp.FlagACK, clientISN+1, testISS+1)
+	ack.Window = wnd
+	if reply := s.Handle(incomingIP(), ack, nil); reply != nil {
+		t.Fatalf("reply to handshake ACK = %x, want nil", reply)
+	}
+	checkState(t, c, tcp.StateEstablished)
+	return c
+}
+
+func repeat(n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = 'a' + byte(i%26)
+	}
+	return b
+}
+
+func TestWrite_Established_SendsSegment(t *testing.T) {
+	// 3.10.2 ESTABLISHED: バッファを切り出して、ACK を相乗りさせて送る (ACK = RCV.NXT)。
+	// 3.9.1.2 MUST-61: 送り切ってキューが空になるセグメントには PSH を立てる
+	s := newTestStack()
+	c := establish(t, s)
+
+	if err := c.Write([]byte("hello")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	segs := takeSent(t, s)
+	if len(segs) != 1 {
+		t.Fatalf("sent %d segments, want 1", len(segs))
+	}
+	checkSegment(t, segs[0].hdr, tcp.FlagACK|tcp.FlagPSH, testISS+1, clientISN+1)
+	if string(segs[0].payload) != "hello" {
+		t.Errorf("payload = %q, want %q", segs[0].payload, "hello")
+	}
+	if c.Snd.NXT != testISS+6 {
+		t.Errorf("Snd.NXT = %d, want %d", c.Snd.NXT, testISS+6)
+	}
+	if c.Snd.UNA != testISS+1 {
+		t.Errorf("Snd.UNA = %d, want %d (not yet acknowledged)", c.Snd.UNA, testISS+1)
+	}
+	if again := takeSent(t, s); len(again) != 0 {
+		t.Errorf("second TakeOutgoing returned %d segments, want 0", len(again))
+	}
+}
+
+func TestWrite_SegmentsByMSS(t *testing.T) {
+	// 3.7.1 MUST-15: MSS オプションを受け取っていなければ、送信 MSS は 536 とみなす。
+	// PSH は最後のセグメントにだけ立てる (MUST-61)
+	tests := []struct {
+		name     string
+		n        int
+		wantLens []int
+	}{
+		{"exactly MSS", 536, []int{536}},
+		{"MSS + 1", 537, []int{536, 1}},
+		{"2 * MSS + 1", 1073, []int{536, 536, 1}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestStack()
+			c := establish(t, s)
+			data := repeat(tt.n)
+			if err := c.Write(data); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			segs := takeSent(t, s)
+			if len(segs) != len(tt.wantLens) {
+				t.Fatalf("sent %d segments, want %d", len(segs), len(tt.wantLens))
+			}
+			seq, off := testISS+1, 0
+			for i, sg := range segs {
+				wantFlags := tcp.FlagACK
+				if i == len(segs)-1 {
+					wantFlags |= tcp.FlagPSH
+				}
+				checkSegment(t, sg.hdr, wantFlags, seq, clientISN+1)
+				if len(sg.payload) != tt.wantLens[i] {
+					t.Errorf("segment %d: len = %d, want %d", i, len(sg.payload), tt.wantLens[i])
+				}
+				if string(sg.payload) != string(data[off:off+len(sg.payload)]) {
+					t.Errorf("segment %d: payload does not match data[%d:]", i, off)
+				}
+				seq += uint32(len(sg.payload))
+				off += len(sg.payload)
+			}
+			if c.Snd.NXT != testISS+1+uint32(tt.n) {
+				t.Errorf("Snd.NXT = %d, want %d", c.Snd.NXT, testISS+1+uint32(tt.n))
+			}
+		})
+	}
+}
+
+func TestWrite_LimitedBySendWindow(t *testing.T) {
+	// 送ってよいのは SND.UNA + SND.WND の手前まで (RFC 9293 3.3.1 の Send Sequence Space の図)。
+	// 残りは送信バッファに残すので、送ったセグメントのあとにもキューにデータがあり、PSH は立てない
+	tests := []struct {
+		name      string
+		wnd       uint16
+		n         int
+		wantLen   int
+		wantFlags tcp.Flag
+	}{
+		{"window == data", 5, 5, 5, tcp.FlagACK | tcp.FlagPSH},
+		{"window == data - 1", 4, 5, 4, tcp.FlagACK},
+		{"window 1", 1, 5, 1, tcp.FlagACK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestStack()
+			c := establishWithWindow(t, s, tt.wnd)
+			if err := c.Write(repeat(tt.n)); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			segs := takeSent(t, s)
+			if len(segs) != 1 {
+				t.Fatalf("sent %d segments, want 1", len(segs))
+			}
+			checkSegment(t, segs[0].hdr, tt.wantFlags, testISS+1, clientISN+1)
+			if len(segs[0].payload) != tt.wantLen {
+				t.Errorf("len = %d, want %d", len(segs[0].payload), tt.wantLen)
+			}
+			if c.Snd.NXT != testISS+1+uint32(tt.wantLen) {
+				t.Errorf("Snd.NXT = %d, want %d", c.Snd.NXT, testISS+1+uint32(tt.wantLen))
+			}
+		})
+	}
+}
+
+func TestWrite_WindowFull_SendsNothing(t *testing.T) {
+	// ウィンドウを使い切ったら、次の Write のデータは送らずにバッファに残す
+	s := newTestStack()
+	c := establishWithWindow(t, s, 5)
+	c.Write([]byte("hello"))
+	takeSent(t, s)
+
+	c.Write([]byte("!"))
+	if segs := takeSent(t, s); len(segs) != 0 {
+		t.Errorf("sent %d segments with a full window, want 0", len(segs))
+	}
+	if c.Snd.NXT != testISS+6 {
+		t.Errorf("Snd.NXT = %d, want %d", c.Snd.NXT, testISS+6)
+	}
+}
+
+func TestWrite_ZeroWindow_SendsNothing(t *testing.T) {
+	// 相手のウィンドウが 0 なら送らない。ゼロウィンドウ probe は M10 (T10-2)
+	s := newTestStack()
+	c := establishWithWindow(t, s, 0)
+	c.Write([]byte("hello"))
+	if segs := takeSent(t, s); len(segs) != 0 {
+		t.Errorf("sent %d segments to a zero window, want 0", len(segs))
+	}
+}
+
+func TestWrite_SynReceived_QueuedUntilEstablished(t *testing.T) {
+	// 3.10.2 SYN-RECEIVED: データは ESTABLISHED になってから送るためにキューに積む。
+	// handshake の ACK で ESTABLISHED になったら、続けて送る
+	s := newTestStack()
+	c := sendSYN(t, s)
+	if err := c.Write([]byte("early")); err != nil {
+		t.Fatalf("Write in SYN-RECEIVED: %v", err)
+	}
+	if segs := takeSent(t, s); len(segs) != 0 {
+		t.Fatalf("sent %d segments in SYN-RECEIVED, want 0", len(segs))
+	}
+
+	s.Handle(incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, testISS+1), nil)
+	segs := takeSent(t, s)
+	if len(segs) != 1 {
+		t.Fatalf("sent %d segments after ESTABLISHED, want 1", len(segs))
+	}
+	// SYN が使った ISS の次から、データの先頭が始まる
+	checkSegment(t, segs[0].hdr, tcp.FlagACK|tcp.FlagPSH, testISS+1, clientISN+1)
+	if string(segs[0].payload) != "early" {
+		t.Errorf("payload = %q, want %q", segs[0].payload, "early")
+	}
+}
+
+func TestWrite_SndNxtWrapsAround(t *testing.T) {
+	// ISS = 0xfffffffe なら、データは 0xffffffff から始まり、SND.NXT は 2^32 をまたいで 4 になる
+	s := newTestStack()
+	s.ISS = func() uint32 { return 0xfffffffe }
+	s.Handle(incomingIP(), incomingTCP(tcp.FlagSYN, clientISN, 0), nil)
+	s.Handle(incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, 0xffffffff), nil)
+	c := s.conns[testKey()]
+	if c == nil {
+		t.Fatal("connection not registered")
+	}
+	c.Write([]byte("hello"))
+	segs := takeSent(t, s)
+	if len(segs) != 1 {
+		t.Fatalf("sent %d segments, want 1", len(segs))
+	}
+	checkSegment(t, segs[0].hdr, tcp.FlagACK|tcp.FlagPSH, 0xffffffff, clientISN+1)
+	if c.Snd.NXT != 4 {
+		t.Errorf("Snd.NXT = %d, want 4", c.Snd.NXT)
+	}
+}
+
+func TestWrite_Closed_ReturnsError(t *testing.T) {
+	// 3.10.2 CLOSED: "error: connection does not exist"。送信キューには何も積まない
+	s := newTestStack()
+	c := establish(t, s)
+	s.Handle(incomingIP(), incomingTCP(tcp.FlagRST, clientISN+1, 0), nil)
+	checkState(t, c, tcp.StateClosed)
+
+	if err := c.Write([]byte("hello")); err == nil {
+		t.Error("Write on a closed connection: err = nil, want an error")
+	}
+	if segs := takeSent(t, s); len(segs) != 0 {
+		t.Errorf("sent %d segments on a closed connection, want 0", len(segs))
+	}
+}

@@ -285,3 +285,9 @@ func (c *Connection) Read(p []byte) int {
 	n, _ := c.rcvBuf.Read(p)
 	return n
 }
+
+// Write は仮の書き込み口 (T6-4)。
+func (c *Connection) Write(p []byte) error { return nil }
+
+// TakeOutgoing は送信キュー (T6-3)。
+func (s *Stack) TakeOutgoing() [][]byte { return nil }
