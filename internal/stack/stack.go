@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"go-tuntcp/internal/ipv4"
 	"go-tuntcp/internal/tcp"
 	"net/netip"
@@ -11,6 +12,9 @@ import (
 
 const (
 	defaultWndSize = 65535
+
+	// defaultSendMSS は、MSS オプションを受け取っていないときの送信 MSS (RFC 9293 3.7.1 MUST-15)
+	defaultSendMSS = 536
 )
 
 // RFC 9293 3.10.7.1 (CLOSED STATE)
@@ -97,9 +101,31 @@ type Connection struct {
 	// rcvBuf は、受け取ったが利用者がまだ読んでいないデータ。RCV.NXT の直前までが入っている。
 	// 大きさは制限しておらず、RCV.WND とも結びついていない (M10 で上限を設け、空きから RCV.WND を決める)
 	rcvBuf bytes.Buffer
+
+	// sndBuf は、利用者が書いたが相手からまだ ACK を受けていないデータ。先頭が SND.UNA に当たる。
+	// 先頭から SND.NXT - SND.UNA バイトは送信済み、残りは未送信。ACK を受けた分を先頭から捨てる。
+	// 大きさは制限していない (M10)
+	sndBuf bytes.Buffer
+
+	// send は、受信への直接の返信以外のパケットを、Stack の送信キューに積む
+	send func(pkt []byte)
 }
 
+// Handle は、この接続に届いたセグメントを 1 つ処理し、直接の返信を返す。返信がなければ nil。
+// Stack.Handle が呼ぶ。
+//
+// 処理のあと、積んであったデータが送れるようになっていれば送る (送信キューに積む)。
+// 相手の ACK でウィンドウが開いたときや、ESTABLISHED になったときに当たる。
+// 送るデータのセグメントにも ACK = RCV.NXT が載るので、セグメントの処理を終えてから送る。
 func (c *Connection) Handle(t tcp.Header, payload []byte) []byte {
+	reply := c.segmentArrives(t, payload)
+	c.output()
+	return reply
+}
+
+// segmentArrives は RFC 9293 3.10.7.4 (SEGMENT ARRIVES の、SYN-RECEIVED 以降の状態) を
+// First から Eighth の順に写したもの。
+func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 	// RFC 9293 3.10.7.4 First: シーケンス番号の検査。
 	// 受理できないセグメントは、相手にいまの RCV.NXT を教え直す ACK を返して捨てる。
 	// 相手が古い状態のまま再送を続けているとき、この ACK で同期し直せる。
@@ -204,6 +230,7 @@ type Stack struct {
 	listeners map[uint16]struct{}     // LISTEN中のポート
 	conns     map[connKey]*Connection // 確立中の接続（SYN-RECEIVED以降）
 	ISS       func() uint32           // 初期シーケンス番号の生成
+	out       [][]byte                // 送信キュー。TakeOutgoing で取り出す
 }
 
 func New() *Stack {
@@ -254,6 +281,7 @@ func (s *Stack) Handle(ip ipv4.Header, t tcp.Header, payload []byte) []byte {
 			return buildRST(ip, t, len(payload))
 		case t.HasFlag(tcp.FlagSYN):
 			c := &Connection{Key: key}
+			c.send = func(pkt []byte) { s.out = append(s.out, pkt) }
 
 			c.Rcv.NXT = t.Seq + 1
 			c.Rcv.IRS = t.Seq
@@ -286,8 +314,76 @@ func (c *Connection) Read(p []byte) int {
 	return n
 }
 
-// Write は仮の書き込み口 (T6-4)。
-func (c *Connection) Write(p []byte) error { return nil }
+// Write は、p を送信バッファの後ろに積み、送れる分をすぐに送る。
+// RFC 9293 3.10.2 SEND Call に従う。SYN-RECEIVED では積むだけにし、ESTABLISHED になってから送る。
+// それ以外の状態ではエラーを返す。
+//
+// 仮の書き込み口。T6-7 のデモで main が呼ぶ。M8 で net.Conn の Write に置き換える。
+// エラーの形 (net.OpError で包むかなど) は T8-5 で決める。
+//
+// やっていないこと:
+//   - CLOSE-WAIT での送信 (未実装。状態がまだない。T7-1)
+//   - 送信バッファの上限と "insufficient resources" (未実装。M10)
+func (c *Connection) Write(p []byte) error {
+	switch c.State {
+	case tcp.StateSynReceived, tcp.StateEstablished:
+		c.sndBuf.Write(p)
+		c.output()
+		return nil
+	default:
+		return errConnNotExist
+	}
+}
 
-// TakeOutgoing は送信キュー (T6-3)。
-func (s *Stack) TakeOutgoing() [][]byte { return nil }
+var errConnNotExist = errors.New("connection does not exist")
+
+// output は、送信バッファのうちまだ送っていない部分を、送ってよい分だけセグメントに切り出して
+// 送信キューに積み、SND.NXT を進める。Write のあとと、受信セグメントを処理したあとに呼ぶ。
+// 受信のあとに呼ぶのは、相手の ACK でウィンドウが開いたり、ESTABLISHED になったりして、
+// 積んであったデータが送れるようになるため。
+//
+// 送ってよいのは SND.NXT から SND.UNA + SND.WND の手前まで (RFC 9293 3.3.1 の図)。
+// 1 セグメントは送信 MSS までにする。MSS オプションをまだ読まないので、
+// RFC 9293 3.7.1 MUST-15 の既定値 536 を使う (M11 で相手の MSS に置き換える)。
+// 送り切って未送信のデータがなくなるセグメントには PSH を立てる (RFC 9293 3.9.1.2 MUST-61。
+// SEND の PUSH フラグは実装しないので、こちらに従う)。
+//
+// やっていないこと:
+//   - 再送キュー (未実装。M9)。送ったデータは ACK されるまで送信バッファに残しておくだけ
+//   - ウィンドウが 0 のときの probe (未実装。T10-2)
+//   - Nagle と SWS 回避 (未実装。T10-3)。小さなセグメントもすぐに送る
+func (c *Connection) output() {
+	if c.State != tcp.StateEstablished {
+		return
+	}
+	for {
+		// sndBuf の先頭は SND.UNA に当たる。SND.NXT - SND.UNA までは送信済み
+		sent := int(c.Snd.NXT - c.Snd.UNA)
+		unsent := c.sndBuf.Len() - sent
+		// 相手がウィンドウを縮めると、SND.NXT が右端を越えていることがある。そのときは負になる
+		usable := int(int32(c.Snd.UNA + uint32(c.Snd.WND) - c.Snd.NXT))
+		n := min(unsent, usable, defaultSendMSS)
+		if n <= 0 {
+			return
+		}
+		flags := tcp.FlagACK
+		if n == unsent {
+			flags |= tcp.FlagPSH
+		}
+		data := c.sndBuf.Bytes()[sent : sent+n]
+		c.send(buildSegment(c.Key.Local, c.Key.Remote, flags, c.Snd.NXT, c.Rcv.NXT, c.Rcv.WND, data))
+		c.Snd.NXT += uint32(n)
+	}
+}
+
+// TakeOutgoing は、送信キューに積まれたパケットを積まれた順に返し、キューを空にする。
+// main が、受信セグメントを Handle に渡したあとと、Connection.Write を呼んだあとに呼び、
+// 返ったパケットを TUN に書く。
+//
+// Handle の戻り値 (受信への直接の返信) とは別の出口にしてある。データの送信のように、
+// 受信を待たずに送るもののため (docs/design.md の「対話で決めた仕様」)。
+func (s *Stack) TakeOutgoing() [][]byte {
+	out := s.out
+	s.out = nil
+	return out
+}
