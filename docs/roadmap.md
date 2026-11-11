@@ -32,9 +32,9 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
 ## 現在の状態（2026-11-11）
 
 - M0〜3（実機確認の自動化、TUN、IPv4、TCP ヘッダ）は完了
-- M4〜5 は T4-8 を残すだけ。handshake のあと、`curl` の HTTP リクエストに ACK を返せる。RST を受けたら接続を消す。受け取ったデータはまだ保存せずに捨てている（T6-2）
+- M4〜5 のタスクはすべて終わった。マイルストーンの終わりの確認（抜き取り、予想の確認）が残っている。handshake のあと、`curl` の HTTP リクエストに ACK を返せる。RST を受けたら接続を消す。受け取ったデータはまだ保存せずに捨てている（T6-2）
 - `task test` はすべて通る
-- `task e2e` は sudo なしで動き、tcpdump の記録から 3-way handshake の成立と、データへの ACK を検証して終了コードで返す
+- `task e2e` は sudo なしで動き、tcpdump の記録から 3-way handshake の成立、データへの ACK、`ss -tn` の `ESTAB` を検証して終了コードで返す
 - `curl` 自体はまだレスポンスを受け取れず、5 秒でタイムアウトする。`task e2e` はこれを失敗として扱っていない（T6-7 で検証に足す）
 
 ## 完了したマイルストーン
@@ -77,8 +77,9 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
   - テスト: `Established_Data`, `Established_UnexpectedSeq` の残り, `ClientSeqWrapsAround`, `MultipleConnections`
   - 受理したが RCV.NXT から始まらないデータは、ACK を返してまるごと捨てると決めた（[design.md](design.md) の「対話で決めた仕様」）
   - `task e2e` の検証に「クライアントのデータに、その末尾までの ACK を返した」を足した
-- [ ] **T4-8** `task e2e` で ESTAB を確かめる
-  - `curl` の最中の `ss -tn` を `tmp/e2e/` に記録し、`ESTAB` が出ることを `scripts/e2e-check.sh` の検証に足す
+- [x] **T4-8** `task e2e` で ESTAB を確かめる
+  - `curl` の最中の `ss -tn` を `tmp/e2e/ss.txt` に記録し、`ESTAB` が出ることを `scripts/e2e-check.sh` の検証に足す
+  - `ss` が見せるのはカーネル（`curl` 側）のソケットの状態。自作スタックの側の状態は、単体テストで確かめている
 
 ## M6: データの送受信
 

@@ -72,11 +72,22 @@ data_acked() {
         END { exit !found }'
 }
 
+# curl の最中に取った ss -tn の記録に、自作スタック宛ての接続が ESTAB で出ている。
+# ss が見せるのはカーネル (curl 側) のソケットの状態なので、カーネルの TCP が
+# 自作スタックの SYN|ACK を受け入れて接続を確立した、という判定になる。
+# ss -tn の 1 行は: $1 State  $2 Recv-Q  $3 Send-Q  $4 Local Address:Port  $5 Peer Address:Port
+ss_estab() {
+  [[ -s "$OUT/ss.txt" ]] || return 1
+  awk -v client="$CLIENT" -v server="$SERVER:$PORT" \
+    '$1 == "ESTAB" && index($4, client ":") == 1 && $5 == server { found = 1 } END { exit !found }' "$OUT/ss.txt"
+}
+
 echo "--- 検証 ---"
 check "クライアントの SYN が届いた" syn_recorded
 check "SYN|ACK を返し、ACK 番号が SYN の SEQ + 1 になっている" synack_acks_syn
 check "クライアントが SYN|ACK に ACK を返した (handshake の完了)" client_completes_handshake
 check "RST が流れていない" no_rst
 check "クライアントのデータに、その末尾までの ACK を返した" data_acked
+check "curl の最中に、ss -tn に ESTAB の接続が出ている" ss_estab
 
 exit "$fail"

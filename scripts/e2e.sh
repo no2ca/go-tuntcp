@@ -22,7 +22,7 @@ fi
 mkdir -p "$OUT"
 # 前回の記録を消す。残っていると、下の「tcpdump がキャプチャを始めるまで待つ」が
 # 前回の tcpdump.err を見てすぐ抜けてしまい、handshake を取りこぼす
-rm -f "$OUT"/tcpdump.txt "$OUT"/tcpdump.err "$OUT"/stack.log
+rm -f "$OUT"/tcpdump.txt "$OUT"/tcpdump.err "$OUT"/stack.log "$OUT"/ss.txt
 ip link set lo up
 
 pids=()
@@ -65,7 +65,18 @@ until grep -q 'listening on' "$OUT/tcpdump.err"; do
   sleep 0.1
 done
 
-curl -sS -m 5 "$TUN_PEER_IP" || true
+# curl を裏で走らせ、その最中のカーネル側のソケットの状態を ss で記録する。
+# -t は TCP だけ、-n は名前を引かずに番号で表示する。
+# handshake は 1 ミリ秒ほどで終わるが、curl の起動を待つ必要があるので、
+# ESTAB が出るまで 0.1 秒おきに最大 3 秒見る。出なければ、最後に見た状態が残る
+curl -sS -m 5 "$TUN_PEER_IP" &
+curl_pid=$!
+for _ in $(seq 30); do
+  ss -tn >"$OUT/ss.txt"
+  if grep -q '^ESTAB' "$OUT/ss.txt"; then break; fi
+  sleep 0.1
+done
+wait "$curl_pid" || true
 
 # tcpdump を止めて出力を書き切らせてから表示する
 kill -INT "$dump" 2>/dev/null || true
@@ -73,5 +84,7 @@ wait "$dump" 2>/dev/null || true
 
 echo "--- tcpdump ($OUT/tcpdump.txt) ---"
 cat "$OUT/tcpdump.txt"
+echo "--- ss -tn ($OUT/ss.txt) ---"
+cat "$OUT/ss.txt"
 
 ./scripts/e2e-check.sh "$OUT"
