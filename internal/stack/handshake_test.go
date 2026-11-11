@@ -7,7 +7,7 @@ import (
 	"go-tuntcp/internal/tcp"
 )
 
-// このファイルは docs/step-handshake.md の完了条件を Handle 経由で検証する。
+// このファイルは 3-way handshake まわりの振る舞い (RFC 9293 3.10.7.2〜3.10.7.4) を Handle 経由で検証する。
 // 内部関数の名前には依存せず、「セグメントを流して返信と TCB を見る」だけにしている。
 
 const (
@@ -395,7 +395,7 @@ func TestHandle_SynReceived_NewSYNInWindow_ReturnsToListen(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// ESTABLISHED: 受信データに ACK を返す (docs/step-handshake.md 6 節)
+// ESTABLISHED: 受信データに ACK を返す (RFC 9293 3.10.7.4 Seventh の最小版)
 // ---------------------------------------------------------------------------
 
 func TestHandle_Established_PureACK_NoReply(t *testing.T) {
