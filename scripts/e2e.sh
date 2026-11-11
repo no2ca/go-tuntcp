@@ -20,6 +20,9 @@ if [[ -z "${E2E_IN_NS:-}" ]]; then
 fi
 
 mkdir -p "$OUT"
+# 前回の記録を消す。残っていると、下の「tcpdump がキャプチャを始めるまで待つ」が
+# 前回の tcpdump.err を見てすぐ抜けてしまい、handshake を取りこぼす
+rm -f "$OUT"/tcpdump.txt "$OUT"/tcpdump.err "$OUT"/stack.log
 ip link set lo up
 
 pids=()
