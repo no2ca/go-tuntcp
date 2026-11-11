@@ -32,9 +32,9 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
 ## 現在の状態（2026-11-11）
 
 - M0〜3（実機確認の自動化、TUN、IPv4、TCP ヘッダ）は完了
-- M4〜5 は途中。LISTEN → SYN-RECEIVED → ESTABLISHED の基本の経路は動き、`curl 10.10.0.2` の SYN に SYN|ACK を返せる
-- `internal/stack` のテストは 22 件中 7 件が失敗する。T4-4、T4-6、T4-7 のテストを先に書いてあるため
-- `task e2e` は sudo なしで動き、tcpdump の記録から 3-way handshake の成立を検証して終了コードで返す
+- M4〜5 は T4-8 を残すだけ。handshake のあと、`curl` の HTTP リクエストに ACK を返せる。RST を受けたら接続を消す。受け取ったデータはまだ保存せずに捨てている（T6-2）
+- `task test` はすべて通る
+- `task e2e` は sudo なしで動き、tcpdump の記録から 3-way handshake の成立と、データへの ACK を検証して終了コードで返す
 - `curl` 自体はまだレスポンスを受け取れず、5 秒でタイムアウトする。`task e2e` はこれを失敗として扱っていない（T6-7 で検証に足す）
 
 ## 完了したマイルストーン
@@ -62,20 +62,21 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
   - modulo 2^32 の比較には `tcp.SeqLT` / `tcp.SeqLE` を使う
   - テスト: `TestSegmentAcceptable`（`internal/tcp`）, `SynReceived_OldSeq_ReACKed`, `SynReceived_RetransmittedSYN`, `Established_ZeroWindow`, `Established_RSTOutOfWindow_Ignored`
   - `Established_UnexpectedSeq` は 4 つのうち 2 つが通る。残りの 2 つ（先に届いた後ろのデータ、RCV.NXT をまたぐデータ）は、First では受理できるセグメントなので、T4-7 で通る
-- [ ] **T4-4** RST の受信（Second）
+- [x] **T4-4** RST の受信（Second）
   - SYN-RECEIVED（passive open）なら LISTEN に戻る。ESTABLISHED なら接続を閉じる
   - テスト: `SynReceived_RST_ReturnsToListen`, `Established_RST_Closes`
   - RFC 5961 の challenge ACK は後回し（目標のあと）
-- [ ] **T4-5** ウィンドウ内の SYN（Fourth）を受けたら LISTEN に戻す
+- [x] **T4-5** ウィンドウ内の SYN（Fourth）を受けたら LISTEN に戻す
   - 実装は済んでいて、テストも通る。T4-3 と T4-4 を入れたあとも通ることを確かめてからチェックを付ける
   - テスト: `SynReceived_NewSYNInWindow_ReturnsToListen`
-- [ ] **T4-6** SYN-RECEIVED での ACK の範囲チェック（Fifth）
+- [x] **T4-6** SYN-RECEIVED での ACK の範囲チェック（Fifth）
   - `SND.UNA < SEG.ACK =< SND.NXT` を満たさなければ `<SEQ=SEG.ACK><CTL=RST>` を返す
-  - テスト: `SynReceived_BadACK`, `ISSWrapsAround`
-- [ ] **T4-7** 順序どおりのデータを受け取って ACK を返す（Seventh の最小版）
+  - テスト: `SynReceived_BadACK`, `SynReceived_BadACK_ISSWrapsAround`, `ISSWrapsAround`
+- [x] **T4-7** 順序どおりのデータを受け取って ACK を返す（Seventh の最小版）
   - RCV.NXT を SEG.LEN だけ進め、`<SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>` を返す。データはまだ保存しない（T6-2）
   - テスト: `Established_Data`, `Established_UnexpectedSeq` の残り, `ClientSeqWrapsAround`, `MultipleConnections`
-  - 受理したが RCV.NXT から始まらないデータの扱いを決める（ACK を返して捨てるか、はみ出た部分を切り落として受け取るか）
+  - 受理したが RCV.NXT から始まらないデータは、ACK を返してまるごと捨てると決めた（[design.md](design.md) の「対話で決めた仕様」）
+  - `task e2e` の検証に「クライアントのデータに、その末尾までの ACK を返した」を足した
 - [ ] **T4-8** `task e2e` で ESTAB を確かめる
   - `curl` の最中の `ss -tn` を `tmp/e2e/` に記録し、`ESTAB` が出ることを `scripts/e2e-check.sh` の検証に足す
 

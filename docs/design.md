@@ -46,7 +46,7 @@ flowchart LR
 | 5 | TCP ヘッダを読み、疑似ヘッダ込みのチェックサムを検査する | RFC 9293 3.1 | `tcp.Parse` | `TestParseTCPHeader*`、`TestVerifyTCPChecksum` | 済。オプションは切り出すだけで解釈しない（M11） |
 | 6 | TCP ヘッダを組み立てる | RFC 9293 3.1 | `tcp.Header.Serialize` | `TestSerializeTCPHeader*` | 済。オプションは付けない（M11） |
 | 7 | シーケンス番号を modulo 2^32 で比べる | RFC 9293 3.4 | `tcp.SeqLT`、`tcp.SeqLE` | `TestSeqCompare` | 済 |
-| 8 | 受信セグメントを 4-tuple で接続に振り分ける | RFC 9293 3.3.1（TCB）、3.10.7 | `Stack.Handle` | `TestHandle_MultipleConnections`（T4-7 まで失敗） | 済 |
+| 8 | 受信セグメントを 4-tuple で接続に振り分ける | RFC 9293 3.3.1（TCB）、3.10.7 | `Stack.Handle` | `TestHandle_MultipleConnections` | 済 |
 | 9 | 接続のないセグメントに RST を返す | RFC 9293 3.10.7.1 | `buildRST` | `TestBuildRST*`、`TestHandle_ClosedPort` | 済 |
 | 10 | LISTEN 中のポートで SYN を受け、SYN\|ACK を返して SYN-RECEIVED にする | RFC 9293 3.10.7.2 | `Stack.Handle` | `TestHandle_Listen*`、`task e2e` の検証 | 済。セキュリティの検査は省略 |
 | 11 | 初期シーケンス番号（ISS）を選ぶ | RFC 9293 3.4.1 | `Stack.ISS`、`randomISS` | なし | 一部。下の「仕様と合っていないもの」を参照 |
@@ -60,13 +60,13 @@ flowchart LR
 
 | 段階 | 内容 | 状態 |
 |---|---|---|
-| First | シーケンス番号の検査 | 済。RCV.WND が 0 のときの例外と、はみ出た部分の切り落としは未 |
-| Second | RST | 未（T4-4） |
+| First | シーケンス番号の検査 | 済。RCV.WND が 0 のときの例外は未（M10）。はみ出た部分の切り落としは省略（「対話で決めた仕様」を参照） |
+| Second | RST | 済。SYN-RECEIVED は LISTEN に、ESTABLISHED は CLOSED にする。RFC 5961 の challenge ACK は目標のあと。利用者への通知は未（M8） |
 | Third | セキュリティ | 省略 |
 | Fourth | SYN | 一部。SYN-RECEIVED で LISTEN に戻る処理だけ。同期済みの状態での扱い（RFC 5961 の challenge ACK）は目標のあと |
-| Fifth | ACK | 一部。SYN-RECEIVED から ESTABLISHED への遷移だけ。ACK の範囲の検査は未（T4-6）、ESTABLISHED での処理は未（T6-6） |
+| Fifth | ACK | 一部。SYN-RECEIVED での範囲の検査と ESTABLISHED への遷移だけ。ESTABLISHED での処理は未（T6-6） |
 | Sixth | URG | 未。扱いを決めていない |
-| Seventh | データ | 未（T4-7、T6-2） |
+| Seventh | データ | 一部。RCV.NXT から始まるデータの分だけ RCV.NXT を進め、ACK を返す。データの保存は未（T6-2） |
 | Eighth | FIN | 未（T7-3） |
 
 ### 仕様と合っていないもの
@@ -103,7 +103,7 @@ flowchart LR
   - 接続がなく、ポートが LISTEN 中なら RFC 9293 3.10.7.2 に従う。SYN なら `Connection` を作って SYN-RECEIVED にし、SYN|ACK を返す
   - どちらでもなければ RFC 9293 3.10.7.1 に従って RST を返す（`buildRST`）
 - `Connection` は `tcp.ControlBlock`（状態と、SND / RCV のシーケンス変数）を埋め込む
-- `Connection.Handle` は RFC 9293 3.10.7.4 の First〜Eighth の順に並べる。いま中身があるのは Fourth（SYN）と Fifth（ACK）の一部だけ
+- `Connection.Handle` は RFC 9293 3.10.7.4 の First〜Eighth の順に並べる。段階ごとの状態は、上の「12 の内訳」の表にある
 
 ## 決まりごと
 
@@ -113,9 +113,22 @@ flowchart LR
 - **RFC の節をコメントに書く。** 差分を RFC と突き合わせて読めるようにする
 - **標準ライブラリだけで書く。** 例外は、テストで使う `golang.org/x/net/nettest` だけ
 
+## 対話で決めた仕様
+
+RFC が決めていない、または RFC の推奨から意図して外れた振る舞い。
+
+- **RCV.NXT から始まらないデータは、ACK を返してまるごと捨てる**（2026-11-11、T4-7）
+  - 対象は、First の検査では受理できるが SEG.SEQ が RCV.NXT と一致しないデータ。先に届いた後ろのデータ（間が抜けている）と、RCV.NXT をまたぐデータ（前半が受信済み）の 2 種類
+  - RCV.NXT は進めず、`<SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>` を返す。相手の再送に任せる
+  - RFC 9293 3.10.7.4 から外れる点: 後ろのデータを取っておくこと（SHLD-31）と、またぐデータの新しい部分だけを処理すること（First の冒頭）をやらない。ACK を返すこと自体は MAY-13 が認めている
+  - 理由: 取っておくには順序の入れ替わりを直すキューが要り、切り落としには境界の分岐が増える。どちらも通信が成り立つためには要らない
+  - 捨てた案: またぐデータの受信済みの部分を切り落とし、新しい部分だけ受け取る
+  - ウィンドウの右端を越えるデータの切り落としは、ここでは決めていない。ウィンドウが 65535 固定の間は起きないので、M10 で決める
+
 ## いまの制限
 
 - `buildSegment` の IPv4 `TotalLen` が 40 固定で、ペイロードを載せられない
+- 受信したデータは ACK だけ返して捨てている（T6-2 で保存する）
 - 送信するセグメントに TCP オプションを付けない（`DataOffset` は 5 固定）。受信したオプションは読み捨てる
 - `Handle` の戻り値が返信 1 つだけなので、受信をきっかけにしない送信（データの送信、再送）ができない
 - 状態は CLOSED、LISTEN、SYN-SENT、SYN-RECEIVED、ESTABLISHED の 5 つだけ

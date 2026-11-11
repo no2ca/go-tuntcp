@@ -101,7 +101,8 @@ func (c *Connection) Handle(t tcp.Header, payload []byte) []byte {
 	//
 	// やっていないこと:
 	//   - RCV.WND が 0 のときも、正しい ACK、URG、RST は受け付ける (未実装。M10 でゼロウィンドウを扱うときに決める)
-	//   - 受理したセグメントのうち、ウィンドウの外にはみ出た部分を切り落とす (未実装。T4-7 で扱いを決める)
+	//   - 受理したセグメントのうち、ウィンドウの外にはみ出た部分を切り落とす
+	//     (意図して省いた。RCV.NXT から始まらないデータは Seventh でまるごと捨てる)
 	if !tcp.SegmentAcceptable(t.Seq, segmentLength(t, len(payload)), c.Rcv.NXT, c.Rcv.WND) {
 		if t.HasFlag(tcp.FlagRST) {
 			return nil
@@ -109,11 +110,31 @@ func (c *Connection) Handle(t tcp.Header, payload []byte) []byte {
 		return buildSegment(c.Key.Local, c.Key.Remote, tcp.FlagACK, c.Snd.NXT, c.Rcv.NXT, c.Rcv.WND, nil)
 	}
 
-	// 2: RST
+	// RFC 9293 3.10.7.4 Second: RST。
+	// 相手がこの接続を捨てたという通知なので、こちらも捨てる。返信はしない。
+	// 状態を LISTEN か CLOSED にしておけば、Stack.Handle が接続をテーブルから消す。
+	// ここに来る RST は First を通っているので、SEG.SEQ は受信ウィンドウの中にある。
+	//
+	// やっていないこと:
+	//   - RFC 5961 の challenge ACK (SEG.SEQ が RCV.NXT と一致しない RST には ACK を返すだけにする)。
+	//     意図して省いた。目標のあとで足す。いまはウィンドウ内の RST ならどれでも接続を閉じる
+	//   - 利用者への "connection reset" の通知と、再送キューの破棄 (未実装。通知する相手もキューもまだ無い。M8、M9)
+	if t.HasFlag(tcp.FlagRST) {
+		switch c.State {
+		case tcp.StateSynReceived:
+			// passive open しか無いので、常に LISTEN に戻る
+			c.State = tcp.StateListen
+		case tcp.StateEstablished:
+			c.State = tcp.StateClosed
+		}
+		return nil
+	}
 
-	// 3: Security Check
+	// RFC 9293 3.10.7.4 Third: セキュリティの検査は意図して省いた。
 
-	// 4: SYN
+	// RFC 9293 3.10.7.4 Fourth: SYN。
+	// やっていないこと: ESTABLISHED で受けた SYN の扱い (RFC 5961 の challenge ACK)。
+	// 意図して省いた。目標のあとで足す。いまは SYN ビットを無視して先へ進む
 	if t.HasFlag(tcp.FlagSYN) {
 		switch c.State {
 		case tcp.StateSynReceived:
@@ -122,23 +143,53 @@ func (c *Connection) Handle(t tcp.Header, payload []byte) []byte {
 		}
 	}
 
-	// 5: ACK
+	// RFC 9293 3.10.7.4 Fifth: ACK。
 	if !t.HasFlag(tcp.FlagACK) {
 		return nil
 	}
 	switch c.State {
 	case tcp.StateSynReceived:
+		// こちらの SYN|ACK への ACK かを確かめる。以前の接続の残りの ACK で
+		// ESTABLISHED になるのを防ぐ。範囲の外なら <SEQ=SEG.ACK><CTL=RST> を返し、
+		// 状態は変えない (正しい ACK があとから届けば確立できる)。
+		// SYN-RECEIVED では SND.UNA = ISS、SND.NXT = ISS+1 なので、通るのは SEG.ACK = ISS+1 だけ
+		if !(tcp.SeqLT(c.Snd.UNA, t.Ack) && tcp.SeqLE(t.Ack, c.Snd.NXT)) {
+			return buildSegment(c.Key.Local, c.Key.Remote, tcp.FlagRST, t.Ack, 0, c.Rcv.WND, nil)
+		}
 		c.State = tcp.StateEstablished
 		c.Snd.UNA = t.Ack
 		c.Snd.WND = t.Window
 		c.Snd.WL1 = t.Seq
 		c.Snd.WL2 = t.Ack
-		// TODO: ACKが許容範囲外の場合RST
+		// やっていないこと: ESTABLISHED での ACK の処理 (未実装。T6-6)。
+		// 仕様では、ESTABLISHED に入ったあと続けてその処理を通る
 	}
 
-	// 6: URG
+	// RFC 9293 3.10.7.4 Sixth: URG は未実装。扱いを決めていない。
 
-	// 7: Segment Text
+	// RFC 9293 3.10.7.4 Seventh: データ。
+	// 受け取った分だけ RCV.NXT を進め、<SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK> で相手に伝える。
+	// データのない ACK には返信しない。返すと ACK 同士の応酬になる。
+	//
+	// RCV.NXT から始まらないデータ (先に届いた後ろのデータ、RCV.NXT をまたぐデータ) は、
+	// いまの RCV.NXT を ACK で教えて、まるごと捨てる。相手の再送に任せる (docs/design.md の決めごと)。
+	// 捨てた案: またぐデータの新しい部分だけを受け取る。再送は減るが、切り落としの境界の分岐が増える。
+	//
+	// やっていないこと:
+	//   - データの保存 (未実装。T6-2)。いまは ACK だけ返してデータを捨てている
+	//   - 先に届いた後ろのデータを取っておく (SHLD-31。意図して省いた)
+	//   - またぐデータの新しい部分だけを処理する (First の冒頭の要求。意図して省いた)
+	//   - ウィンドウの右端を越えた分の切り落とし (未実装。ウィンドウを 65535 で固定している間は、
+	//     1 つの IP パケットに入るデータが越えることはない。M10 でウィンドウを動かすときに要る)
+	//   - ACK を遅らせて送信データに相乗りさせる (未実装)
+	if c.State == tcp.StateEstablished && len(payload) > 0 {
+		if t.Seq == c.Rcv.NXT {
+			c.Rcv.NXT += uint32(len(payload))
+		}
+		return buildSegment(c.Key.Local, c.Key.Remote, tcp.FlagACK, c.Snd.NXT, c.Rcv.NXT, c.Rcv.WND, nil)
+	}
+
+	// RFC 9293 3.10.7.4 Eighth: FIN は未実装 (T7-3)。
 
 	return nil
 }
