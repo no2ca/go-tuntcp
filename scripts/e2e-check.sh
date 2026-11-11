@@ -62,10 +62,21 @@ no_rst() {
   dump '$6 == "Flags" && $7 ~ /R/ { found = 1 } END { exit found }'
 }
 
+# 相手のデータ (HTTP リクエスト) の末尾までを ACK で受け取ったと伝えている (RFC 9293 3.10.7.4 Seventh)。
+# データの行は "seq 1:74," の形で、74 が次に来るはずの番号。それと同じ ACK 番号を返していること
+data_acked() {
+  dump 'index($3, client ".") == 1 && $5 == server ":" && $8 == "seq" && $9 ~ /:/ && !have_end {
+          split($9, r, /[:,]/); end = r[2] + 0; have_end = 1
+        }
+        have_end && $3 == server && $7 == "[.]," && $8 == "ack" && $9 + 0 == end { found = 1 }
+        END { exit !found }'
+}
+
 echo "--- 検証 ---"
 check "クライアントの SYN が届いた" syn_recorded
 check "SYN|ACK を返し、ACK 番号が SYN の SEQ + 1 になっている" synack_acks_syn
 check "クライアントが SYN|ACK に ACK を返した (handshake の完了)" client_completes_handshake
 check "RST が流れていない" no_rst
+check "クライアントのデータに、その末尾までの ACK を返した" data_acked
 
 exit "$fail"

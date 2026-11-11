@@ -316,6 +316,33 @@ func TestHandle_SynReceived_BadACK(t *testing.T) {
 	}
 }
 
+func TestHandle_SynReceived_BadACK_ISSWrapsAround(t *testing.T) {
+	// ISS = 0xffffffff なら SND.UNA = 0xffffffff、SND.NXT = 0。受け付ける ACK は 0 だけ
+	// (TestHandle_ISSWrapsAround)。その両隣は、数値の大小では範囲の中に見えても拒否する。
+	tests := []struct {
+		name string
+		ack  uint32
+	}{
+		{"SEG.ACK == SND.UNA", 0xffffffff},
+		{"SEG.ACK == SND.NXT+1", 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestStack()
+			s.ISS = func() uint32 { return 0xffffffff }
+			mustReply(t, s.Handle(incomingIP(), incomingTCP(tcp.FlagSYN, clientISN, 0), nil))
+			c := s.conns[testKey()]
+			if c == nil {
+				t.Fatal("connection not registered after SYN")
+			}
+
+			th, _ := mustReply(t, s.Handle(incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, tt.ack), nil))
+			checkSegment(t, th, tcp.FlagRST, tt.ack, 0)
+			checkState(t, c, tcp.StateSynReceived)
+		})
+	}
+}
+
 func TestHandle_SynReceived_NoACK_Dropped(t *testing.T) {
 	// Fifth: ACK ビットの無いセグメントは捨てる (返信も状態変化も無し)
 	s := newTestStack()
@@ -439,14 +466,17 @@ func TestHandle_Established_Data(t *testing.T) {
 
 func TestHandle_Established_UnexpectedSeq(t *testing.T) {
 	// 順序が前後した / 古い / ウィンドウ外のデータ: RCV.NXT は進めず、今の RCV.NXT を ACK で教え直す。
+	// RCV.NXT をまたぐデータも、新しい部分だけを受け取ることはせず、まるごと捨てる (docs/design.md の決めごと)。
 	const rcvNXT = clientISN + 1
 	tests := []struct {
 		name string
 		seq  uint32
 	}{
 		{"out of order (gap ahead)", rcvNXT + 100},
+		{"out of order (one byte ahead)", rcvNXT + 1},
 		{"old duplicate (entirely before RCV.NXT)", rcvNXT - 10},
 		{"overlapping (starts before RCV.NXT)", rcvNXT - 2},
+		{"overlapping (one byte before RCV.NXT)", rcvNXT - 1},
 		{"beyond receive window", rcvNXT + uint32(defaultWndSize) + 1000},
 	}
 	for _, tt := range tests {
@@ -592,7 +622,8 @@ func TestHandle_ClientSeqWrapsAround(t *testing.T) {
 
 func TestHandle_MultipleConnections(t *testing.T) {
 	s := newTestStack()
-	iss := testISS
+	// 1 本目は testISS、2 本目は testISS+100 を引く (establish が testISS を前提にしている)
+	iss := testISS - 100
 	s.ISS = func() uint32 { iss += 100; return iss }
 
 	// 1 本目 (54321) は ESTABLISHED まで進める
@@ -601,7 +632,8 @@ func TestHandle_MultipleConnections(t *testing.T) {
 	// 2 本目 (54322) の SYN。1 本目の状態に影響してはいけない。
 	syn2 := incomingTCP(tcp.FlagSYN, 7000, 0)
 	syn2.SrcPort = 54322
-	th, _ := mustReply(t, s.Handle(incomingIP(), syn2, nil))
+	// mustReply は宛先が peerPort であることまで見るので、2 本目には使えない
+	_, th, _ := parseReply(t, s.Handle(incomingIP(), syn2, nil))
 	if th.DstPort != 54322 {
 		t.Errorf("SYN|ACK DstPort = %d, want 54322", th.DstPort)
 	}
