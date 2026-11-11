@@ -70,3 +70,5 @@ wait "$dump" 2>/dev/null || true
 
 echo "--- tcpdump ($OUT/tcpdump.txt) ---"
 cat "$OUT/tcpdump.txt"
+
+./scripts/e2e-check.sh "$OUT"
