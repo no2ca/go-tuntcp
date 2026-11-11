@@ -1,3 +1,4 @@
 go-tuntcp
 .vscode/
 tmp/
+.claude/settings.local.json
