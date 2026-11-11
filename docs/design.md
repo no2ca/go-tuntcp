@@ -79,6 +79,7 @@ flowchart LR
 
 - `defaultWndSize = 65535`: なぜこの値かが、どこにも書いていない。受信バッファと結びついていない（M10 で直る）
 - `buildSegment` の `TotalLen: 40`: ペイロードがない前提の固定値（T6-1 で直る）
+- RST のウィンドウの欄: 接続のあるとき（`Connection.Handle`）は `c.Rcv.WND`、ないとき（`buildRST`）は `defaultWndSize` を入れている。RFC 9293 は RST のウィンドウの値を決めていない。揃っておらず、理由も書いていない
 - `Stack.Handle` の `// TODO: セキュリティ情報が...`: 省略と決めたのか、未実装なのかが書いていない
 - `cmd/tuntcp` が、送る前の返信をもう一度パースしている: 表示のためだけの処理で、TCP のパースのエラーを捨てている
 - どのテストも通らない行: `randomISS` の中身（テストは `Stack.ISS` を差し替えるため）

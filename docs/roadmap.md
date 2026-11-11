@@ -31,8 +31,8 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
 
 ## 現在の状態（2026-11-11）
 
-- M0〜3（実機確認の自動化、TUN、IPv4、TCP ヘッダ）は完了
-- M4〜5 のタスクはすべて終わった。マイルストーンの終わりの確認（抜き取り、予想の確認）が残っている。handshake のあと、`curl` の HTTP リクエストに ACK を返せる。RST を受けたら接続を消す。受け取ったデータはまだ保存せずに捨てている（T6-2）
+- M0〜5（実機確認の自動化、TUN、IPv4、TCP ヘッダ、状態機械と 3-way handshake）は完了。次は M6 の T6-1
+- handshake のあと、`curl` の HTTP リクエストに ACK を返せる。RST を受けたら接続を消す。受け取ったデータはまだ保存せずに捨てている（T6-2）
 - `task test` はすべて通る
 - `task e2e` は sudo なしで動き、tcpdump の記録から 3-way handshake の成立、データへの ACK、`ss -tn` の `ESTAB` を検証して終了コードで返す
 - `curl` 自体はまだレスポンスを受け取れず、5 秒でタイムアウトする。`task e2e` はこれを失敗として扱っていない（T6-7 で検証に足す）
@@ -46,40 +46,14 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
 - [x] **M1** TUN デバイスから IP パケットを読み書きする
 - [x] **M2** IPv4 ヘッダのパース、シリアライズ、チェックサム
 - [x] **M3** TCP ヘッダのパース、シリアライズ、フラグ、チェックサム
+- [x] **M4〜5** 状態機械と 3-way handshake（T4-1〜T4-8）
+  - LISTEN → SYN-RECEIVED → ESTABLISHED の passive open。RFC 9293 3.10.7.4 の First（受理判定）、Second（RST）、Fourth（SYN-RECEIVED での SYN）、Fifth（SYN-RECEIVED での ACK の範囲）、Seventh の最小版（データに ACK を返す。保存はしない）
+  - RCV.NXT から始まらないデータは、ACK を返してまるごと捨てる（[design.md](design.md) の「対話で決めた仕様」）
+  - 段階ごとの分岐とテストの対応は [internal/stack/README.md](../internal/stack/README.md) にある
+  - `task e2e` が、handshake の成立、データへの ACK、`curl` の最中の `ss -tn` の `ESTAB` を検証する
+  - 後回しにしたもの: RFC 5961 の challenge ACK（目標のあと）、RCV.WND が 0 のときの例外（M10）、URG（扱いを決めていない）
 
 ---
-
-## M4〜5: 状態機械と 3-way handshake（残り）
-
-完了条件: `task test` がすべて通る。`curl 10.10.0.2` の最中に `ss -tn` で `ESTAB` が見える
-
-- [x] **T4-1** `StringFlags` の表示順とテストを揃える
-- [x] **T4-2** 接続を接続テーブルから消す仕組み
-  - 接続が LISTEN か CLOSED に戻ったら、`Stack.Handle` が `conns` から削除する
-- [x] **T4-3** セグメントの受理判定（First: シーケンス番号の検査）
-  - RFC 9293 [3.10.7.4](https://datatracker.ietf.org/doc/html/rfc9293#section-3.10.7.4) First の表（SEG.LEN と RCV.WND がそれぞれ 0 かどうかで 4 通り）
-  - 受理できなければ `<SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>` を返して捨てる。RST が立っていれば何も返さない
-  - modulo 2^32 の比較には `tcp.SeqLT` / `tcp.SeqLE` を使う
-  - テスト: `TestSegmentAcceptable`（`internal/tcp`）, `SynReceived_OldSeq_ReACKed`, `SynReceived_RetransmittedSYN`, `Established_ZeroWindow`, `Established_RSTOutOfWindow_Ignored`
-  - `Established_UnexpectedSeq` は 4 つのうち 2 つが通る。残りの 2 つ（先に届いた後ろのデータ、RCV.NXT をまたぐデータ）は、First では受理できるセグメントなので、T4-7 で通る
-- [x] **T4-4** RST の受信（Second）
-  - SYN-RECEIVED（passive open）なら LISTEN に戻る。ESTABLISHED なら接続を閉じる
-  - テスト: `SynReceived_RST_ReturnsToListen`, `Established_RST_Closes`
-  - RFC 5961 の challenge ACK は後回し（目標のあと）
-- [x] **T4-5** ウィンドウ内の SYN（Fourth）を受けたら LISTEN に戻す
-  - 実装は済んでいて、テストも通る。T4-3 と T4-4 を入れたあとも通ることを確かめてからチェックを付ける
-  - テスト: `SynReceived_NewSYNInWindow_ReturnsToListen`
-- [x] **T4-6** SYN-RECEIVED での ACK の範囲チェック（Fifth）
-  - `SND.UNA < SEG.ACK =< SND.NXT` を満たさなければ `<SEQ=SEG.ACK><CTL=RST>` を返す
-  - テスト: `SynReceived_BadACK`, `SynReceived_BadACK_ISSWrapsAround`, `ISSWrapsAround`
-- [x] **T4-7** 順序どおりのデータを受け取って ACK を返す（Seventh の最小版）
-  - RCV.NXT を SEG.LEN だけ進め、`<SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>` を返す。データはまだ保存しない（T6-2）
-  - テスト: `Established_Data`, `Established_UnexpectedSeq` の残り, `ClientSeqWrapsAround`, `MultipleConnections`
-  - 受理したが RCV.NXT から始まらないデータは、ACK を返してまるごと捨てると決めた（[design.md](design.md) の「対話で決めた仕様」）
-  - `task e2e` の検証に「クライアントのデータに、その末尾までの ACK を返した」を足した
-- [x] **T4-8** `task e2e` で ESTAB を確かめる
-  - `curl` の最中の `ss -tn` を `tmp/e2e/ss.txt` に記録し、`ESTAB` が出ることを `scripts/e2e-check.sh` の検証に足す
-  - `ss` が見せるのはカーネル（`curl` 側）のソケットの状態。自作スタックの側の状態は、単体テストで確かめている
 
 ## M6: データの送受信
 
