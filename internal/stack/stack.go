@@ -68,10 +68,11 @@ func buildSegment(local, remote netip.AddrPort, flags tcp.Flag, seq, ack uint32,
 
 	ipPayload := tcpHdr.Serialize(local.Addr().As4(), remote.Addr().As4(), payload)
 
+	// RFC 791 3.1: Total Length は IP ヘッダ (オプションなしで 20) とデータを合わせた長さ
 	ipHdr := ipv4.Header{
 		Version:  4,
 		IHL:      5,
-		TotalLen: 40,
+		TotalLen: uint16(20 + len(ipPayload)),
 		TTL:      64,
 		Protocol: ipv4.ProtoTCP,
 		Src:      local.Addr(),
