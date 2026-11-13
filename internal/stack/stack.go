@@ -107,24 +107,27 @@ type Connection struct {
 	// 大きさは制限していない (M10)
 	sndBuf bytes.Buffer
 
-	// send は、受信への直接の返信以外のパケットを、Stack の送信キューに積む
+	// send は、この接続が送るパケットを Stack の送信キューに積む
 	send func(pkt []byte)
 }
 
-// Handle は、この接続に届いたセグメントを 1 つ処理し、直接の返信を返す。返信がなければ nil。
-// Stack.Handle が呼ぶ。
+// Handle は、この接続に届いたセグメントを 1 つ処理する。Stack.Handle が呼ぶ。
+// 送るものは、セグメントへの返信、データの順に送信キューに積む。
 //
-// 処理のあと、積んであったデータが送れるようになっていれば送る (送信キューに積む)。
+// 処理のあと、積んであったデータが送れるようになっていれば送る。
 // 相手の ACK でウィンドウが開いたときや、ESTABLISHED になったときに当たる。
 // 送るデータのセグメントにも ACK = RCV.NXT が載るので、セグメントの処理を終えてから送る。
-func (c *Connection) Handle(t tcp.Header, payload []byte) []byte {
-	reply := c.segmentArrives(t, payload)
+func (c *Connection) Handle(t tcp.Header, payload []byte) {
+	if reply := c.segmentArrives(t, payload); reply != nil {
+		c.send(reply)
+	}
 	c.output()
-	return reply
 }
 
 // segmentArrives は RFC 9293 3.10.7.4 (SEGMENT ARRIVES の、SYN-RECEIVED 以降の状態) を
-// First から Eighth の順に写したもの。
+// First から Eighth の順に写したもの。このセグメントへの返信を返す。返信がなければ nil。
+// 返信を戻り値にしてあるのは、仕様の "send ... and return" をそのまま return 1 つで書くため。
+// 送信キューに積むのは呼び出し元の Handle。
 func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 	// RFC 9293 3.10.7.4 First: シーケンス番号の検査。
 	// 受理できないセグメントは、相手にいまの RCV.NXT を教え直す ACK を返して捨てる。
@@ -262,7 +265,7 @@ type Stack struct {
 	listeners map[uint16]struct{}     // LISTEN中のポート
 	conns     map[connKey]*Connection // 確立中の接続（SYN-RECEIVED以降）
 	ISS       func() uint32           // 初期シーケンス番号の生成
-	out       [][]byte                // 送信キュー。TakeOutgoing で取り出す
+	out       [][]byte                // 送信キュー。送るパケットはすべてここを通る。TakeOutgoing で取り出す
 }
 
 func New() *Stack {
@@ -291,7 +294,13 @@ func (s *Stack) Listen(port uint16) {
 	s.listeners[port] = struct{}{}
 }
 
-func (s *Stack) Handle(ip ipv4.Header, t tcp.Header, payload []byte) []byte {
+// Handle は、受信セグメントを 1 つ処理する。送るパケットは送信キューに積み、戻り値では返さない。
+// 呼んだ側は、続けて TakeOutgoing で取り出して TUN に書く。
+//
+// 捨てた案: セグメントへの返信 (ACK、RST、SYN|ACK) だけを戻り値で返す (T7-0 までの形)。
+// 送る順番を呼ぶ側が守ることになり、再送する SYN|ACK や Close で送る FIN のように、
+// 受信を起点にしない送信と出口が分かれる。
+func (s *Stack) Handle(ip ipv4.Header, t tcp.Header, payload []byte) {
 	key := connKey{
 		Local:  netip.AddrPortFrom(ip.Dst, t.DstPort),
 		Remote: netip.AddrPortFrom(ip.Src, t.SrcPort),
@@ -299,15 +308,27 @@ func (s *Stack) Handle(ip ipv4.Header, t tcp.Header, payload []byte) []byte {
 
 	// 既存の接続
 	if c, ok := s.conns[key]; ok {
-		reply := c.Handle(t, payload)
+		c.Handle(t, payload)
 		// LISTEN か CLOSED に戻った接続はテーブルから消す。
 		// LISTEN はポート単位で listeners が受け持つので、接続を残す必要はない
 		if c.State == tcp.StateListen || c.State == tcp.StateClosed {
 			delete(s.conns, key)
 		}
-		return reply
+		return
 	}
 
+	if reply := s.segmentArrivesNoConn(key, ip, t, payload); reply != nil {
+		s.send(reply)
+	}
+}
+
+func (s *Stack) send(pkt []byte) {
+	s.out = append(s.out, pkt)
+}
+
+// segmentArrivesNoConn は、接続のないセグメントを処理し、返信を返す。返信がなければ nil。
+// ポートが LISTEN 中なら RFC 9293 3.10.7.2、そうでなければ 3.10.7.1 に従う。
+func (s *Stack) segmentArrivesNoConn(key connKey, ip ipv4.Header, t tcp.Header, payload []byte) []byte {
 	// RSTを受信したとき
 	if t.HasFlag(tcp.FlagRST) {
 		return nil
@@ -320,8 +341,7 @@ func (s *Stack) Handle(ip ipv4.Header, t tcp.Header, payload []byte) []byte {
 		case t.HasFlag(tcp.FlagACK):
 			return buildRST(ip, t, len(payload))
 		case t.HasFlag(tcp.FlagSYN):
-			c := &Connection{Key: key}
-			c.send = func(pkt []byte) { s.out = append(s.out, pkt) }
+			c := &Connection{Key: key, send: s.send}
 
 			c.Rcv.NXT = t.Seq + 1
 			c.Rcv.IRS = t.Seq
@@ -418,10 +438,7 @@ func (c *Connection) output() {
 
 // TakeOutgoing は、送信キューに積まれたパケットを積まれた順に返し、キューを空にする。
 // main が、受信セグメントを Handle に渡したあとと、Connection.Write を呼んだあとに呼び、
-// 返ったパケットを TUN に書く。
-//
-// Handle の戻り値 (受信への直接の返信) とは別の出口にしてある。データの送信のように、
-// 受信を待たずに送るもののため (docs/design.md の「対話で決めた仕様」)。
+// 返ったパケットを積まれた順に TUN に書く。
 func (s *Stack) TakeOutgoing() [][]byte {
 	out := s.out
 	s.out = nil

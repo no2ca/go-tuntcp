@@ -29,9 +29,9 @@ TUN デバイスの上に TCP プロトコルスタックを実装するまで�
 
 deadline を範囲に入れるのは、`net/http` が使うため。`http.Server` はブロック中の `Read` を中断するのに `SetReadDeadline` を過去の時刻で呼ぶ（Go の `net/http/server.go` の `abortPendingRead`）。何もしない実装では、接続の後始末で止まる。
 
-## 現在の状態（2026-11-11）
+## 現在の状態（2026-11-13）
 
-- M0〜6（実機確認の自動化、TUN、IPv4、TCP ヘッダ、handshake、データの送受信）は完了。次は M7 の T7-1
+- M0〜6（実機確認の自動化、TUN、IPv4、TCP ヘッダ、handshake、データの送受信）は完了。M7 は T7-0 まで済み。次は T7-1
 - `curl` が仮のデモ（`cmd/tuntcp` の `demoServer`）から固定の HTTP レスポンスを受け取り、終了コード 0 で終わる
 - FIN はまだ扱わない（T7-3）。`curl` が閉じたあと、カーネルは FIN を再送し続け、`ss -tn` には `FIN-WAIT-1` が残る
 - `task test` はすべて通る
@@ -55,10 +55,10 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
 
 - [x] **M6** データの送受信（T6-1〜T6-7）
   - 受信: RCV.NXT から始まるデータを受信バッファに貯め、`Connection.Read`（仮の口）で読み出す
-  - 送信: `Connection.Write`（仮の口）で送信バッファに積み、SND.NXT から相手のウィンドウと MSS 536 に収まる分を切り出して送る。受信を待たずに送るパケットは `Stack.TakeOutgoing` の送信キューから出す
+  - 送信: `Connection.Write`（仮の口）で送信バッファに積み、SND.NXT から相手のウィンドウと MSS 536 に収まる分を切り出して送る。送るパケットは `Stack.TakeOutgoing` の送信キューから出す
   - ESTABLISHED での ACK（Fifth）: SND.UNA を進めて送信バッファから捨て、SND.WL1 / SND.WL2 の条件で送信ウィンドウを更新する
   - `task e2e` が、`curl` の受け取った本文と、レスポンスへの ACK を検証する
-  - AI が決めた仕様（送信キューの形、仮の読み書き口）は [design.md](design.md) の「対話で決めた仕様」にあり、人間の確認待ち
+  - AI が決めた仕様のうち、仮の読み書き口は [design.md](design.md) の「対話で決めた仕様」にあり、人間の確認待ち。送信キューの形は T7-0 で人間が決め直した
   - 後回しにしたもの: 受信バッファと送信バッファの上限、広告ウィンドウを空きから決めること（M10）、ACK を遅らせてデータに相乗りさせること（決めていない）
 
 ---
@@ -69,6 +69,8 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
 
 - 終了コード 0 は M6 の時点ですでに満たしている（`curl` は Content-Length の分を受け取ると、FIN の返事を待たずに終わる）。残るのは接続の後始末
 
+- [x] **T7-0** 送る出口を送信キュー 1 つにまとめる
+  - `Stack.Handle` の戻り値をなくし、返信も送信キューに積む。振る舞いは変えない。FIN とタイマーのテストを、最初からこの形で書くため
 - [ ] **T7-1** 状態の追加（FIN-WAIT-1, FIN-WAIT-2, CLOSING, TIME-WAIT, CLOSE-WAIT, LAST-ACK）と stringer の再生成
 - [ ] **T7-2** 時刻の注入とタイマーの基盤
   - テストで時間を進められるよう、時計を差し替え可能にする。M9 の再送でも使う（[design.md](design.md) の「これから変えるところ」の 2）

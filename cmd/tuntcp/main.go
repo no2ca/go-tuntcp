@@ -65,10 +65,7 @@ func main() {
 			}
 			displayTCP(t)
 
-			// 受信への直接の返信を先に送り、そのあと送信キューに積まれたもの (データなど) を送る
-			if reply := stk.Handle(ip, t, tcpPayload); reply != nil {
-				send(dev, reply)
-			}
+			stk.Handle(ip, t, tcpPayload)
 			local := netip.AddrPortFrom(ip.Dst, t.DstPort)
 			remote := netip.AddrPortFrom(ip.Src, t.SrcPort)
 			if c := stk.Conn(local, remote); c != nil {
