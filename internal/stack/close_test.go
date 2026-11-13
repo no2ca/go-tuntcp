@@ -238,7 +238,9 @@ func TestHandle_CloseWait_ACK_SendsRemainingData(t *testing.T) {
 	// ACK で SND.UNA が進み、ウィンドウが開いて、残りのデータが送られる
 	s := newTestStack()
 	c := establishWithWindow(t, s, 5)
-	s.Handle(incomingIP(), incomingTCP(tcp.FlagFIN|tcp.FlagACK, clientISN+1, testISS+1), nil)
+	fin := incomingTCP(tcp.FlagFIN|tcp.FlagACK, clientISN+1, testISS+1)
+	fin.Window = 5 // FIN のセグメントもウィンドウを広告する。5 のままにしておく
+	s.Handle(incomingIP(), fin, nil)
 	takeSent(t, s) // FIN への ACK
 	mustState(t, c, tcp.StateCloseWait)
 	if err := c.Write([]byte("hello world")); err != nil {

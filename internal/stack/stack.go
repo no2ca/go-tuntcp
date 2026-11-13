@@ -147,6 +147,7 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 
 	// RFC 9293 3.10.7.4 Second: RST。
 	// 相手がこの接続を捨てたという通知なので、こちらも捨てる。返信はしない。
+	// SYN-RECEIVED は LISTEN に戻し、同期済みの状態は CLOSED にする。
 	// 状態を LISTEN か CLOSED にしておけば、Stack.Handle が接続をテーブルから消す。
 	// ここに来る RST は First を通っているので、SEG.SEQ は受信ウィンドウの中にある。
 	//
@@ -159,7 +160,7 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 		case tcp.StateSynReceived:
 			// passive open しか無いので、常に LISTEN に戻る
 			c.State = tcp.StateListen
-		case tcp.StateEstablished:
+		case tcp.StateEstablished, tcp.StateCloseWait:
 			c.State = tcp.StateClosed
 		}
 		return nil
@@ -201,7 +202,8 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 		c.Snd.UNA = t.Ack
 		// 仕様どおり、続けて ESTABLISHED の処理を通る
 		fallthrough
-	case tcp.StateEstablished:
+	case tcp.StateEstablished, tcp.StateCloseWait:
+		// ESTABLISHED の処理。CLOSE-WAIT でも同じことをする ("Do the same processing as for the ESTABLISHED state")。
 		// 送ったデータへの ACK を受け、SND.UNA を進め、ACK されたデータを送信バッファから捨てる。
 		// 重複した ACK (SEG.ACK =< SND.UNA) は無視するが、セグメントの処理は続ける
 		// (ウィンドウの更新やデータの受け取りがありうる)。
@@ -234,6 +236,10 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 
 	// RFC 9293 3.10.7.4 Sixth: URG は未実装。扱いを決めていない。
 
+	// 返信の ACK は、Seventh と Eighth を終えてから 1 つだけ作る。データと FIN が同じセグメントで
+	// 届いたとき、両方をまとめて 1 つの ACK で返すため (MUST-58)
+	ackNeeded := false
+
 	// RFC 9293 3.10.7.4 Seventh: データ。
 	// 受け取ったデータを受信バッファに移し、その分だけ RCV.NXT を進め、<SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK> で相手に伝える。
 	// データのない ACK には返信しない。返すと ACK 同士の応酬になる。
@@ -241,6 +247,9 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 	// RCV.NXT から始まらないデータ (先に届いた後ろのデータ、RCV.NXT をまたぐデータ) は、
 	// いまの RCV.NXT を ACK で教えて、まるごと捨てる。相手の再送に任せる (docs/design.md の決めごと)。
 	// 捨てた案: またぐデータの新しい部分だけを受け取る。再送は減るが、切り落としの境界の分岐が増える。
+	//
+	// 相手の FIN を受けたあとの状態 (CLOSE-WAIT、CLOSING、LAST-ACK、TIME-WAIT) では、データは来ないはずなので
+	// 無視する ("Ignore the segment text")。受け取らず、ACK も返さない。
 	//
 	// やっていないこと:
 	//   - 先に届いた後ろのデータを取っておく (SHLD-31。意図して省いた)
@@ -253,11 +262,40 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 			c.rcvBuf.Write(payload)
 			c.Rcv.NXT += uint32(len(payload))
 		}
-		return buildSegment(c.Key.Local, c.Key.Remote, tcp.FlagACK, c.Snd.NXT, c.Rcv.NXT, c.Rcv.WND, nil)
+		ackNeeded = true
 	}
 
-	// RFC 9293 3.10.7.4 Eighth: FIN は未実装 (T7-3)。
+	// RFC 9293 3.10.7.4 Eighth: FIN。
+	// 相手が「もう送るものはない」と伝えてきた。FIN はシーケンス番号を 1 つ使う (3.4) ので、
+	// RCV.NXT を 1 進めて ACK を返し、状態を移す。
+	//
+	// FIN を処理するのは、FIN の番号 (SEG.SEQ + データ長) が RCV.NXT と一致するときだけ。
+	// 仕様は、ここに来るセグメントを「RCV.NXT から始まる理想のセグメント」と仮定している (First の末尾)。
+	// 手前が抜けたまま FIN を受け取ると、抜けたデータを受け取らずに相手の送信が終わったことになってしまう。
+	// 一致しない FIN (手前が抜けている、捨てたデータに付いていた) には、いまの RCV.NXT を ACK で返すだけにする (MAY-13)。
+	// 受信済みのデータの再送に新しい FIN が付いているときは、データを Seventh で捨てたあと、ここで FIN だけを処理する。
+	//
+	// すでに FIN を受けた状態 (CLOSE-WAIT など) で RCV.NXT から始まる FIN がまた来たときも、
+	// 仕様の文面どおり RCV.NXT を進めて ACK を返す (状態は "Remain")。相手の誤りでしか起きない。
+	// 再送された FIN は SEG.SEQ が RCV.NXT の手前なので、First で落ちてここには来ない。
+	//
+	// やっていないこと:
+	//   - 利用者への "connection closing" の通知 (未実装。Read が io.EOF を返すようにするのは T8-5)
+	if t.HasFlag(tcp.FlagFIN) {
+		if t.Seq+uint32(len(payload)) == c.Rcv.NXT {
+			c.Rcv.NXT++
+			switch c.State {
+			case tcp.StateEstablished:
+				// SYN-RECEIVED で受けた FIN もここに来る。Fifth を通った時点で ESTABLISHED になっている
+				c.State = tcp.StateCloseWait
+			}
+		}
+		ackNeeded = true
+	}
 
+	if ackNeeded {
+		return buildSegment(c.Key.Local, c.Key.Remote, tcp.FlagACK, c.Snd.NXT, c.Rcv.NXT, c.Rcv.WND, nil)
+	}
 	return nil
 }
 
@@ -376,17 +414,17 @@ func (c *Connection) Read(p []byte) int {
 
 // Write は、p を送信バッファの後ろに積み、送れる分をすぐに送る。
 // RFC 9293 3.10.2 SEND Call に従う。SYN-RECEIVED では積むだけにし、ESTABLISHED になってから送る。
+// CLOSE-WAIT でも送れる (相手が送り終えただけで、こちらからの向きは開いている)。
 // それ以外の状態ではエラーを返す。
 //
 // 仮の書き込み口。T6-7 のデモで main が呼ぶ。M8 で net.Conn の Write に置き換える。
 // エラーの形 (net.OpError で包むかなど) は T8-5 で決める。
 //
 // やっていないこと:
-//   - CLOSE-WAIT での送信 (未実装。状態がまだない。T7-1)
 //   - 送信バッファの上限と "insufficient resources" (未実装。M10)
 func (c *Connection) Write(p []byte) error {
 	switch c.State {
-	case tcp.StateSynReceived, tcp.StateEstablished:
+	case tcp.StateSynReceived, tcp.StateEstablished, tcp.StateCloseWait:
 		c.sndBuf.Write(p)
 		c.output()
 		return nil
@@ -413,7 +451,9 @@ var errConnNotExist = errors.New("connection does not exist")
 //   - ウィンドウが 0 のときの probe (未実装。T10-2)
 //   - Nagle と SWS 回避 (未実装。T10-3)。小さなセグメントもすぐに送る
 func (c *Connection) output() {
-	if c.State != tcp.StateEstablished {
+	switch c.State {
+	case tcp.StateEstablished, tcp.StateCloseWait:
+	default:
 		return
 	}
 	for {

@@ -75,9 +75,11 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
   - `stringer` を取得できなかったので、`state_string.go` は stringer の出力と同じ形に手で作り直した。名前は `TestState_String` が確かめる
 - [ ] **T7-2** 時刻の注入とタイマーの基盤
   - テストで時間を進められるよう、時計を差し替え可能にする。M9 の再送でも使う（[design.md](design.md) の「これから変えるところ」の 2）
-- [ ] **T7-3** FIN の受信（Eighth）
+- [x] **T7-3** FIN の受信（Eighth）
   - RCV.NXT を 1 進めて ACK を返す（FIN もシーケンス番号を 1 消費する）
   - 状態ごとの遷移: ESTABLISHED → CLOSE-WAIT、FIN-WAIT-1 → CLOSING、FIN-WAIT-2 → TIME-WAIT
+  - FIN-WAIT-1 で受けた FIN が自分の FIN への ACK も運んでいれば、CLOSING ではなく TIME-WAIT に入る（RFC 9293 3.3.2 の Note 2）
+  - FIN-WAIT-1 と FIN-WAIT-2 での遷移は、その状態に入る手段（Close）が要るので T7-4 で実装した
 - [ ] **T7-4** 自分から閉じる（Close）
   - FIN を送る: ESTABLISHED → FIN-WAIT-1、CLOSE-WAIT → LAST-ACK
   - 自分の FIN への ACK を受けたときの遷移: FIN-WAIT-1 → FIN-WAIT-2、CLOSING → TIME-WAIT、LAST-ACK → CLOSED
