@@ -300,6 +300,8 @@ func TestHeader_StringFlags(t *testing.T) {
 }
 
 func TestState_String(t *testing.T) {
+	// 状態の名前は RFC 9293 3.3.2 の表記に合わせる。テストの失敗に出る名前を、
+	// RFC の本文や ss の表示と突き合わせられるようにするため
 	tests := []struct {
 		state State
 		want  string
@@ -309,10 +311,16 @@ func TestState_String(t *testing.T) {
 		{StateSynSent, "SYN-SENT"},
 		{StateSynReceived, "SYN-RECEIVED"},
 		{StateEstablished, "ESTABLISHED"},
+		{StateFinWait1, "FIN-WAIT-1"},
+		{StateFinWait2, "FIN-WAIT-2"},
+		{StateCloseWait, "CLOSE-WAIT"},
+		{StateClosing, "CLOSING"},
+		{StateLastAck, "LAST-ACK"},
+		{StateTimeWait, "TIME-WAIT"},
 	}
 	for _, tt := range tests {
 		if got := tt.state.String(); got != tt.want {
-			t.Errorf("State(%d).String() = %q, want %q", tt.state, got, tt.want)
+			t.Errorf("State(%d).String() = %q, want %q", int(tt.state), got, tt.want)
 		}
 	}
 }
