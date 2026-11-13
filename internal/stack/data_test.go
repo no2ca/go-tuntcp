@@ -167,7 +167,7 @@ func establishWithWindow(t *testing.T, s *Stack, wnd uint16) *Connection {
 	c := sendSYN(t, s)
 	ack := incomingTCP(tcp.FlagACK, clientISN+1, testISS+1)
 	ack.Window = wnd
-	if reply := s.Handle(incomingIP(), ack, nil); reply != nil {
+	if reply := handle(t, s, incomingIP(), ack, nil); reply != nil {
 		t.Fatalf("reply to handshake ACK = %x, want nil", reply)
 	}
 	checkState(t, c, tcp.StateEstablished)
@@ -347,7 +347,7 @@ func TestWrite_SndNxtWrapsAround(t *testing.T) {
 	// ISS = 0xfffffffe なら、データは 0xffffffff から始まり、SND.NXT は 2^32 をまたいで 4 になる
 	s := newTestStack()
 	s.ISS = func() uint32 { return 0xfffffffe }
-	s.Handle(incomingIP(), incomingTCP(tcp.FlagSYN, clientISN, 0), nil)
+	handle(t, s, incomingIP(), incomingTCP(tcp.FlagSYN, clientISN, 0), nil)
 	s.Handle(incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, 0xffffffff), nil)
 	c := s.conns[testKey()]
 	if c == nil {
@@ -408,7 +408,7 @@ func TestHandle_Established_ACK(t *testing.T) {
 			c.Write([]byte("hello"))
 			takeSent(t, s)
 
-			reply := s.Handle(incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, tt.ack), nil)
+			reply := handle(t, s, incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, tt.ack), nil)
 			if tt.wantACK {
 				th, _ := mustReply(t, reply)
 				checkSegment(t, th, tcp.FlagACK, nxt, clientISN+1)
@@ -431,7 +431,7 @@ func TestHandle_Established_ACKForUnsentData_DropsSegment(t *testing.T) {
 	s := newTestStack()
 	c := establish(t, s)
 
-	th, _ := mustReply(t, s.Handle(incomingIP(), incomingTCP(tcp.FlagPSH|tcp.FlagACK, clientISN+1, testISS+2), []byte("hi")))
+	th, _ := mustReply(t, handle(t, s, incomingIP(), incomingTCP(tcp.FlagPSH|tcp.FlagACK, clientISN+1, testISS+2), []byte("hi")))
 	checkSegment(t, th, tcp.FlagACK, testISS+1, clientISN+1)
 	if c.Rcv.NXT != clientISN+1 {
 		t.Errorf("Rcv.NXT = %d, want %d (segment dropped)", c.Rcv.NXT, clientISN+1)
@@ -446,7 +446,7 @@ func TestHandle_Established_ACK_SndUnaWrapsAround(t *testing.T) {
 	// SEG.ACK = 2 は 2^32 をまたいで SND.UNA より後ろにあり、受け入れる
 	s := newTestStack()
 	s.ISS = func() uint32 { return 0xfffffffe }
-	s.Handle(incomingIP(), incomingTCP(tcp.FlagSYN, clientISN, 0), nil)
+	handle(t, s, incomingIP(), incomingTCP(tcp.FlagSYN, clientISN, 0), nil)
 	s.Handle(incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, 0xffffffff), nil)
 	c := s.conns[testKey()]
 	if c == nil {
@@ -455,7 +455,7 @@ func TestHandle_Established_ACK_SndUnaWrapsAround(t *testing.T) {
 	c.Write([]byte("hello"))
 	takeSent(t, s)
 
-	if reply := s.Handle(incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, 2), nil); reply != nil {
+	if reply := handle(t, s, incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, 2), nil); reply != nil {
 		t.Errorf("reply = %x, want nil", reply)
 	}
 	if c.Snd.UNA != 2 {
@@ -534,9 +534,15 @@ func TestHandle_Established_WindowUpdate(t *testing.T) {
 				t.Errorf("Snd.WND = %d, want %d", c.Snd.WND, tt.wantWND)
 			}
 			if tt.wantWND == 100 {
-				segs := takeSent(t, s)
+				// データを載せた行では、その返信の ACK が先に積まれる。見るのはデータのセグメントだけ
+				var segs []sentSegment
+				for _, seg := range takeSent(t, s) {
+					if len(seg.payload) > 0 {
+						segs = append(segs, seg)
+					}
+				}
 				if len(segs) != 1 || string(segs[0].payload) != " world" {
-					t.Errorf("after window update: sent %d segments, want 1 with %q", len(segs), " world")
+					t.Errorf("after window update: sent %d data segments, want 1 with %q", len(segs), " world")
 				}
 			}
 		})
@@ -558,5 +564,36 @@ func TestHandle_Established_WindowShrinks(t *testing.T) {
 
 	if segs := takeSent(t, s); len(segs) != 0 {
 		t.Errorf("sent %d segments beyond a shrunk window, want 0", len(segs))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T7-0: 送る出口は送信キュー 1 つ (docs/design.md の「対話で決めた仕様」)
+// ---------------------------------------------------------------------------
+
+func TestHandle_Established_DataAndWindowOpen_QueuesACKThenData(t *testing.T) {
+	// 1 つのセグメントが、データを運び、同時にウィンドウを開く。
+	// 送信キューには、データへの ACK、送れるようになったデータの順に積まれる。
+	// どちらも SEQ は testISS+6 で、ACK は受け取った "abc" の次を指す
+	s := newTestStack()
+	establishWithWindow(t, s, 5)
+	s.conns[testKey()].Write([]byte("hello world"))
+	takeSent(t, s) // "hello"
+
+	in := incomingTCP(tcp.FlagPSH|tcp.FlagACK, clientISN+1, testISS+6)
+	in.Window = 100
+	s.Handle(incomingIP(), in, []byte("abc"))
+
+	segs := takeSent(t, s)
+	if len(segs) != 2 {
+		t.Fatalf("queued %d segments, want 2 (ACK, data)", len(segs))
+	}
+	checkSegment(t, segs[0].hdr, tcp.FlagACK, testISS+6, clientISN+4)
+	if len(segs[0].payload) != 0 {
+		t.Errorf("first segment payload = %q, want empty (ACK)", segs[0].payload)
+	}
+	checkSegment(t, segs[1].hdr, tcp.FlagACK|tcp.FlagPSH, testISS+6, clientISN+4)
+	if string(segs[1].payload) != " world" {
+		t.Errorf("second segment payload = %q, want %q", segs[1].payload, " world")
 	}
 }

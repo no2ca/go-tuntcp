@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"testing"
 
+	"go-tuntcp/internal/ipv4"
 	"go-tuntcp/internal/tcp"
 )
 
@@ -28,6 +29,27 @@ func testKey() connKey {
 	return connKey{
 		Local:  netip.AddrPortFrom(ourAddr, localPort),
 		Remote: netip.AddrPortFrom(peerAddr, peerPort),
+	}
+}
+
+// handle は、セグメントを Stack.Handle に渡し、その処理で送信キューに積まれたパケットを返す。
+// 積まれなければ nil。返信が高々 1 つのセグメントを流すときに使う。
+// 2 つ以上積まれる入力 (返信の ACK とデータなど) は、s.Handle と takeSent で見る。
+func handle(t *testing.T, s *Stack, ip ipv4.Header, th tcp.Header, payload []byte) []byte {
+	t.Helper()
+	if n := len(s.out); n != 0 {
+		t.Fatalf("handle: %d packets left in the queue before Handle; take them first", n)
+	}
+	s.Handle(ip, th, payload)
+	out := s.TakeOutgoing()
+	switch len(out) {
+	case 0:
+		return nil
+	case 1:
+		return out[0]
+	default:
+		t.Fatalf("handle: Handle queued %d packets, want at most 1", len(out))
+		return nil
 	}
 }
 
@@ -70,7 +92,7 @@ func checkState(t *testing.T, c *Connection, want tcp.State) {
 // SYN を送り、SYN|ACK が返って SYN-RECEIVED の接続ができるところまで進める。
 func sendSYN(t *testing.T, s *Stack) *Connection {
 	t.Helper()
-	th, _ := mustReply(t, s.Handle(incomingIP(), incomingTCP(tcp.FlagSYN, clientISN, 0), nil))
+	th, _ := mustReply(t, handle(t, s, incomingIP(), incomingTCP(tcp.FlagSYN, clientISN, 0), nil))
 	checkSegment(t, th, tcp.FlagSYN|tcp.FlagACK, testISS, clientISN+1)
 
 	c := s.conns[testKey()]
@@ -85,7 +107,7 @@ func sendSYN(t *testing.T, s *Stack) *Connection {
 func establish(t *testing.T, s *Stack) *Connection {
 	t.Helper()
 	c := sendSYN(t, s)
-	if reply := s.Handle(incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, testISS+1), nil); reply != nil {
+	if reply := handle(t, s, incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, testISS+1), nil); reply != nil {
 		t.Fatalf("reply to handshake ACK = %x, want nil", reply)
 	}
 	checkState(t, c, tcp.StateEstablished)
@@ -112,7 +134,7 @@ func TestHandle_ClosedPort(t *testing.T) {
 			s := newTestStack()
 			tt.in.DstPort = 8080 // LISTEN していない
 
-			pkt := s.Handle(incomingIP(), tt.in, nil)
+			pkt := handle(t, s, incomingIP(), tt.in, nil)
 			if pkt == nil {
 				t.Fatal("reply = nil, want RST")
 			}
@@ -194,7 +216,7 @@ func TestHandle_Listen(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := newTestStack()
-			pkt := s.Handle(incomingIP(), tt.in, nil)
+			pkt := handle(t, s, incomingIP(), tt.in, nil)
 
 			if !tt.wantReply {
 				if pkt != nil {
@@ -246,7 +268,7 @@ func TestHandle_Listen_SYN_InitializesTCB(t *testing.T) {
 func TestHandle_Listen_SYNACK_AdvertisesWindow(t *testing.T) {
 	// SYN|ACK で Window=0 を広告すると相手はデータを送ってこない (zero window)。
 	s := newTestStack()
-	th, _ := mustReply(t, s.Handle(incomingIP(), incomingTCP(tcp.FlagSYN, clientISN, 0), nil))
+	th, _ := mustReply(t, handle(t, s, incomingIP(), incomingTCP(tcp.FlagSYN, clientISN, 0), nil))
 
 	c := s.conns[testKey()]
 	if c == nil {
@@ -305,7 +327,7 @@ func TestHandle_SynReceived_BadACK(t *testing.T) {
 			s := newTestStack()
 			c := sendSYN(t, s)
 
-			th, _ := mustReply(t, s.Handle(incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, tt.ack), nil))
+			th, _ := mustReply(t, handle(t, s, incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, tt.ack), nil))
 			checkSegment(t, th, tcp.FlagRST, tt.ack, 0)
 
 			checkState(t, c, tcp.StateSynReceived)
@@ -330,13 +352,13 @@ func TestHandle_SynReceived_BadACK_ISSWrapsAround(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s := newTestStack()
 			s.ISS = func() uint32 { return 0xffffffff }
-			mustReply(t, s.Handle(incomingIP(), incomingTCP(tcp.FlagSYN, clientISN, 0), nil))
+			mustReply(t, handle(t, s, incomingIP(), incomingTCP(tcp.FlagSYN, clientISN, 0), nil))
 			c := s.conns[testKey()]
 			if c == nil {
 				t.Fatal("connection not registered after SYN")
 			}
 
-			th, _ := mustReply(t, s.Handle(incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, tt.ack), nil))
+			th, _ := mustReply(t, handle(t, s, incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, tt.ack), nil))
 			checkSegment(t, th, tcp.FlagRST, tt.ack, 0)
 			checkState(t, c, tcp.StateSynReceived)
 		})
@@ -348,7 +370,7 @@ func TestHandle_SynReceived_NoACK_Dropped(t *testing.T) {
 	s := newTestStack()
 	c := sendSYN(t, s)
 
-	if reply := s.Handle(incomingIP(), incomingTCP(tcp.FlagPSH, clientISN+1, 0), []byte("x")); reply != nil {
+	if reply := handle(t, s, incomingIP(), incomingTCP(tcp.FlagPSH, clientISN+1, 0), []byte("x")); reply != nil {
 		t.Errorf("reply = %x, want nil", reply)
 	}
 	checkState(t, c, tcp.StateSynReceived)
@@ -360,7 +382,7 @@ func TestHandle_SynReceived_OldSeq_ReACKed(t *testing.T) {
 	s := newTestStack()
 	c := sendSYN(t, s)
 
-	th, _ := mustReply(t, s.Handle(incomingIP(), incomingTCP(tcp.FlagACK, clientISN, testISS+1), nil))
+	th, _ := mustReply(t, handle(t, s, incomingIP(), incomingTCP(tcp.FlagACK, clientISN, testISS+1), nil))
 	checkSegment(t, th, tcp.FlagACK, testISS+1, clientISN+1)
 
 	checkState(t, c, tcp.StateSynReceived)
@@ -371,7 +393,7 @@ func TestHandle_SynReceived_RST_ReturnsToListen(t *testing.T) {
 	s := newTestStack()
 	sendSYN(t, s)
 
-	if reply := s.Handle(incomingIP(), incomingTCP(tcp.FlagRST, clientISN+1, 0), nil); reply != nil {
+	if reply := handle(t, s, incomingIP(), incomingTCP(tcp.FlagRST, clientISN+1, 0), nil); reply != nil {
 		t.Errorf("reply = %x, want nil", reply)
 	}
 	if _, ok := s.conns[testKey()]; ok {
@@ -388,7 +410,7 @@ func TestHandle_SynReceived_RetransmittedSYN(t *testing.T) {
 	s := newTestStack()
 	c := sendSYN(t, s)
 
-	reply := s.Handle(incomingIP(), incomingTCP(tcp.FlagSYN, clientISN, 0), nil)
+	reply := handle(t, s, incomingIP(), incomingTCP(tcp.FlagSYN, clientISN, 0), nil)
 
 	if _, ok := s.conns[testKey()]; !ok {
 		t.Fatal("connection removed by a retransmitted SYN")
@@ -429,7 +451,7 @@ func TestHandle_Established_PureACK_NoReply(t *testing.T) {
 	s := newTestStack()
 	c := establish(t, s)
 
-	if reply := s.Handle(incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, testISS+1), nil); reply != nil {
+	if reply := handle(t, s, incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, testISS+1), nil); reply != nil {
 		t.Errorf("reply = %x, want nil (nothing to acknowledge)", reply)
 	}
 	checkState(t, c, tcp.StateEstablished)
@@ -443,7 +465,7 @@ func TestHandle_Established_Data(t *testing.T) {
 	c := establish(t, s)
 
 	// 1 通目: 順序どおりのデータ → RCV.NXT が進み、<SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK> が返る
-	th, payload := mustReply(t, s.Handle(incomingIP(), incomingTCP(tcp.FlagPSH|tcp.FlagACK, clientISN+1, testISS+1), get))
+	th, payload := mustReply(t, handle(t, s, incomingIP(), incomingTCP(tcp.FlagPSH|tcp.FlagACK, clientISN+1, testISS+1), get))
 	checkSegment(t, th, tcp.FlagACK, testISS+1, clientISN+1+n)
 	if len(payload) != 0 {
 		t.Errorf("payload = %x, want empty", payload)
@@ -457,7 +479,7 @@ func TestHandle_Established_Data(t *testing.T) {
 	checkState(t, c, tcp.StateEstablished)
 
 	// 2 通目: 続きのデータ → さらに進む
-	th, _ = mustReply(t, s.Handle(incomingIP(), incomingTCP(tcp.FlagPSH|tcp.FlagACK, clientISN+1+n, testISS+1), []byte("hello")))
+	th, _ = mustReply(t, handle(t, s, incomingIP(), incomingTCP(tcp.FlagPSH|tcp.FlagACK, clientISN+1+n, testISS+1), []byte("hello")))
 	checkSegment(t, th, tcp.FlagACK, testISS+1, clientISN+1+n+5)
 	if c.Rcv.NXT != clientISN+1+n+5 {
 		t.Errorf("Rcv.NXT = %d, want %d", c.Rcv.NXT, clientISN+1+n+5)
@@ -484,7 +506,7 @@ func TestHandle_Established_UnexpectedSeq(t *testing.T) {
 			s := newTestStack()
 			c := establish(t, s)
 
-			th, _ := mustReply(t, s.Handle(incomingIP(), incomingTCP(tcp.FlagPSH|tcp.FlagACK, tt.seq, testISS+1), []byte("hello")))
+			th, _ := mustReply(t, handle(t, s, incomingIP(), incomingTCP(tcp.FlagPSH|tcp.FlagACK, tt.seq, testISS+1), []byte("hello")))
 			checkSegment(t, th, tcp.FlagACK, testISS+1, rcvNXT)
 
 			if c.Rcv.NXT != rcvNXT {
@@ -517,7 +539,7 @@ func TestHandle_Established_ZeroWindow(t *testing.T) {
 			c := establish(t, s)
 			c.Rcv.WND = 0
 
-			reply := s.Handle(incomingIP(), incomingTCP(tcp.FlagACK, tt.seq, testISS+1), tt.payload)
+			reply := handle(t, s, incomingIP(), incomingTCP(tcp.FlagACK, tt.seq, testISS+1), tt.payload)
 			if !tt.wantReply {
 				if reply != nil {
 					t.Errorf("reply = %x, want nil", reply)
@@ -540,7 +562,7 @@ func TestHandle_Established_RSTOutOfWindow_Ignored(t *testing.T) {
 	c := establish(t, s)
 
 	outOfWindow := c.Rcv.NXT + uint32(c.Rcv.WND) + 1000
-	if reply := s.Handle(incomingIP(), incomingTCP(tcp.FlagRST, outOfWindow, 0), nil); reply != nil {
+	if reply := handle(t, s, incomingIP(), incomingTCP(tcp.FlagRST, outOfWindow, 0), nil); reply != nil {
 		t.Errorf("reply = %x, want nil", reply)
 	}
 	if _, ok := s.conns[testKey()]; !ok {
@@ -553,7 +575,7 @@ func TestHandle_Established_RST_Closes(t *testing.T) {
 	s := newTestStack()
 	establish(t, s)
 
-	if reply := s.Handle(incomingIP(), incomingTCP(tcp.FlagRST, clientISN+1, 0), nil); reply != nil {
+	if reply := handle(t, s, incomingIP(), incomingTCP(tcp.FlagRST, clientISN+1, 0), nil); reply != nil {
 		t.Errorf("reply = %x, want nil", reply)
 	}
 	if _, ok := s.conns[testKey()]; ok {
@@ -571,7 +593,7 @@ func TestHandle_ISSWrapsAround(t *testing.T) {
 	s := newTestStack()
 	s.ISS = func() uint32 { return 0xffffffff }
 
-	th, _ := mustReply(t, s.Handle(incomingIP(), incomingTCP(tcp.FlagSYN, clientISN, 0), nil))
+	th, _ := mustReply(t, handle(t, s, incomingIP(), incomingTCP(tcp.FlagSYN, clientISN, 0), nil))
 	checkSegment(t, th, tcp.FlagSYN|tcp.FlagACK, 0xffffffff, clientISN+1)
 
 	c := s.conns[testKey()]
@@ -582,7 +604,7 @@ func TestHandle_ISSWrapsAround(t *testing.T) {
 		t.Fatalf("Snd.NXT = %d, want 0", c.Snd.NXT)
 	}
 
-	if reply := s.Handle(incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, 0), nil); reply != nil {
+	if reply := handle(t, s, incomingIP(), incomingTCP(tcp.FlagACK, clientISN+1, 0), nil); reply != nil {
 		_, rth, _ := parseReply(t, reply)
 		t.Fatalf("reply = %s, want nil (ack=0 must be accepted as ISS+1)", rth.StringFlags())
 	}
@@ -597,10 +619,10 @@ func TestHandle_ClientSeqWrapsAround(t *testing.T) {
 	const isn = uint32(0xffffffff)
 	s := newTestStack()
 
-	th, _ := mustReply(t, s.Handle(incomingIP(), incomingTCP(tcp.FlagSYN, isn, 0), nil))
+	th, _ := mustReply(t, handle(t, s, incomingIP(), incomingTCP(tcp.FlagSYN, isn, 0), nil))
 	checkSegment(t, th, tcp.FlagSYN|tcp.FlagACK, testISS, 0)
 
-	if reply := s.Handle(incomingIP(), incomingTCP(tcp.FlagACK, 0, testISS+1), nil); reply != nil {
+	if reply := handle(t, s, incomingIP(), incomingTCP(tcp.FlagACK, 0, testISS+1), nil); reply != nil {
 		t.Fatalf("reply = %x, want nil", reply)
 	}
 	c := s.conns[testKey()]
@@ -609,7 +631,7 @@ func TestHandle_ClientSeqWrapsAround(t *testing.T) {
 	}
 	checkState(t, c, tcp.StateEstablished)
 
-	th, _ = mustReply(t, s.Handle(incomingIP(), incomingTCP(tcp.FlagPSH|tcp.FlagACK, 0, testISS+1), []byte("hello")))
+	th, _ = mustReply(t, handle(t, s, incomingIP(), incomingTCP(tcp.FlagPSH|tcp.FlagACK, 0, testISS+1), []byte("hello")))
 	checkSegment(t, th, tcp.FlagACK, testISS+1, 5)
 	if c.Rcv.NXT != 5 {
 		t.Errorf("Rcv.NXT = %d, want 5", c.Rcv.NXT)
@@ -633,7 +655,7 @@ func TestHandle_MultipleConnections(t *testing.T) {
 	syn2 := incomingTCP(tcp.FlagSYN, 7000, 0)
 	syn2.SrcPort = 54322
 	// mustReply は宛先が peerPort であることまで見るので、2 本目には使えない
-	_, th, _ := parseReply(t, s.Handle(incomingIP(), syn2, nil))
+	_, th, _ := parseReply(t, handle(t, s, incomingIP(), syn2, nil))
 	if th.DstPort != 54322 {
 		t.Errorf("SYN|ACK DstPort = %d, want 54322", th.DstPort)
 	}
