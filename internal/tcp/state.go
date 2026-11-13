@@ -11,6 +11,12 @@ const (
 	StateSynSent                  // SYN-SENT
 	StateSynReceived              // SYN-RECEIVED
 	StateEstablished              // ESTABLISHED
+	StateFinWait1                 // FIN-WAIT-1
+	StateFinWait2                 // FIN-WAIT-2
+	StateCloseWait                // CLOSE-WAIT
+	StateClosing                  // CLOSING
+	StateLastAck                  // LAST-ACK
+	StateTimeWait                 // TIME-WAIT
 )
 
 // SendSequenceSpace は RFC 9293 3.3.1 の Send Sequence Variables

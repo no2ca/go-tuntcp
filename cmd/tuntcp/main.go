@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"go-tuntcp/internal/ipv4"
 	"go-tuntcp/internal/stack"
@@ -39,10 +40,21 @@ func main() {
 	stk.Listen(80)
 	demo := newDemoServer()
 
+	// タイマーの期限は、Stack.HandleTimeouts を呼んだときに調べられる。いまあるタイマーは
+	// TIME-WAIT の 2MSL (4 分) だけなので、1 秒おきで足りる。再送タイマー (M9) を入れるときに、
+	// 次の期限まで待つ形に変える (M8 のイベントループ)
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-tick.C:
+			stk.HandleTimeouts()
+			for _, pkt := range stk.TakeOutgoing() {
+				send(dev, pkt)
+			}
 		case res := <-ch:
 			packet := res.buf[:res.n]
 			displayRawRx(packet)
@@ -78,7 +90,7 @@ func main() {
 	}
 }
 
-// demoServer は、HTTP リクエストを受け取ったら決まったレスポンスを返す仮のデモ (T6-7)。
+// demoServer は、HTTP リクエストを受け取ったら決まったレスポンスを返して閉じる仮のデモ (T6-7、T7-7)。
 // リクエストの中身は解釈せず、ヘッダの終わり (空行) が届いたら 1 回返す。本文のあるリクエストは扱わない。
 // M8 で net.Listener と net.Conn ができたら、http.Serve に置き換えて捨てる (T8-8)。
 type demoServer struct {
@@ -88,9 +100,12 @@ type demoServer struct {
 // demoBody は scripts/e2e-check.sh が curl の受け取った本文と比べる。変えるときは両方を直す
 const demoBody = "hello from go-tuntcp\n"
 
+// レスポンスのあとに接続を閉じるので、Connection: close を付ける (RFC 9112 9.6:
+// 持続的な接続を扱わないサーバは、すべてのレスポンスで close を送る)
 var demoResponse = []byte("HTTP/1.1 200 OK\r\n" +
 	"Content-Type: text/plain\r\n" +
 	fmt.Sprintf("Content-Length: %d\r\n", len(demoBody)) +
+	"Connection: close\r\n" +
 	"\r\n" +
 	demoBody)
 
@@ -98,7 +113,14 @@ func newDemoServer() *demoServer {
 	return &demoServer{pending: make(map[*stack.Connection][]byte)}
 }
 
+// serve は、受信セグメントを 1 つ処理するたびに main が呼ぶ。
+// 閉じるのは 2 つの場合。レスポンスを書いたあと (こちらが先に閉じる) と、
+// リクエストが揃う前に相手が閉じたとき (CLOSE-WAIT。こちらも閉じないと、接続が残り続ける)。
 func (d *demoServer) serve(c *stack.Connection) {
+	// 送れる状態のときだけ相手をする。Close を呼んだあとは、FIN のやりとりを Stack に任せる
+	if c.State != tcp.StateEstablished && c.State != tcp.StateCloseWait {
+		return
+	}
 	buf := make([]byte, 1500)
 	for {
 		n := c.Read(buf)
@@ -107,14 +129,18 @@ func (d *demoServer) serve(c *stack.Connection) {
 		}
 		d.pending[c] = append(d.pending[c], buf[:n]...)
 	}
-	req := d.pending[c]
-	end := bytes.Index(req, []byte("\r\n\r\n"))
-	if end < 0 {
+	complete := bytes.Contains(d.pending[c], []byte("\r\n\r\n"))
+	if !complete && c.State != tcp.StateCloseWait {
 		return
 	}
-	d.pending[c] = req[end+4:]
-	if err := c.Write(demoResponse); err != nil {
-		log.Printf("demo: write: %v", err)
+	delete(d.pending, c)
+	if complete {
+		if err := c.Write(demoResponse); err != nil {
+			log.Printf("demo: write: %v", err)
+		}
+	}
+	if err := c.Close(); err != nil {
+		log.Printf("demo: close: %v", err)
 	}
 }
 

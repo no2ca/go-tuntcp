@@ -13,11 +13,17 @@ func _() {
 	_ = x[StateSynSent-2]
 	_ = x[StateSynReceived-3]
 	_ = x[StateEstablished-4]
+	_ = x[StateFinWait1-5]
+	_ = x[StateFinWait2-6]
+	_ = x[StateCloseWait-7]
+	_ = x[StateClosing-8]
+	_ = x[StateLastAck-9]
+	_ = x[StateTimeWait-10]
 }
 
-const _State_name = "CLOSEDLISTENSYN-SENTSYN-RECEIVEDESTABLISHED"
+const _State_name = "CLOSEDLISTENSYN-SENTSYN-RECEIVEDESTABLISHEDFIN-WAIT-1FIN-WAIT-2CLOSE-WAITCLOSINGLAST-ACKTIME-WAIT"
 
-var _State_index = [...]uint8{0, 6, 12, 20, 32, 43}
+var _State_index = [...]uint8{0, 6, 12, 20, 32, 43, 53, 63, 73, 80, 88, 97}
 
 func (i State) String() string {
 	idx := int(i) - 0

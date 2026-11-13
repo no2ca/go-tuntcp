@@ -31,6 +31,7 @@ check() {
 
 # tcpdump -ttt の 1 行は次の形。awk では空白で区切って $1, $2, ... と数える。
 #   $1 経過時間  $2 "IP"  $3 送信元.ポート  $4 ">"  $5 宛先.ポート":"  $6 "Flags"  $7 "[S],"  $8 "seq"  $9 値 ...
+# 見る記録は DUMP で決まる。2 本目のクライアントの検査では、呼ぶときに DUMP を差し替える
 dump() {
   awk -v client="$CLIENT" -v server="$SERVER.$PORT" "$1" "$DUMP"
 }
@@ -72,21 +73,6 @@ data_acked() {
         END { exit !found }'
 }
 
-# curl の最中に取った ss -tn の記録に、自作スタック宛ての接続が ESTAB か、そのあとの状態で出ている。
-# ss が見せるのはカーネル (curl 側) のソケットの状態なので、カーネルの TCP が
-# 自作スタックの SYN|ACK を受け入れて接続を確立した、という判定になる。
-# T6-7 から curl は接続の 1 ミリ秒ほどあとに終わるので、0.1 秒おきの ss では ESTAB を
-# 取り逃がし、curl が閉じたあとの FIN-WAIT-1 などが記録に残る。
-# FIN-WAIT-1/2、CLOSING、TIME-WAIT は、能動的に開いた側からは ESTABLISHED を経ないと入れない
-# (RFC 9293 3.3.2 の図。SYN-RECEIVED からの CLOSE は同時オープンのときだけ) ので、確立の証拠に含める。
-# ss -tn の 1 行は: $1 State  $2 Recv-Q  $3 Send-Q  $4 Local Address:Port  $5 Peer Address:Port
-ss_estab() {
-  [[ -s "$OUT/ss.txt" ]] || return 1
-  awk -v client="$CLIENT" -v server="$SERVER:$PORT" \
-    '$1 ~ /^(ESTAB|FIN-WAIT-1|FIN-WAIT-2|CLOSING|TIME-WAIT)$/ && index($4, client ":") == 1 && $5 == server { found = 1 }
-     END { exit !found }' "$OUT/ss.txt"
-}
-
 # --- M6: データの送受信 ---
 
 # 自作スタックが送ったデータ (HTTP レスポンス) の末尾までを、クライアントが ACK した。
@@ -105,14 +91,65 @@ body_received() {
   [[ -f "$OUT/curl.txt" ]] && [[ "$(cat "$OUT/curl.txt")" == "hello from go-tuntcp" ]]
 }
 
+# --- M7: 切断 ---
+
+curl_succeeded() {
+  [[ -f "$OUT/curl.exit" ]] && [[ "$(cat "$OUT/curl.exit")" == "0" ]]
+}
+
+# 自作スタックが FIN を送り、クライアントがその次の番号を ACK した。
+# FIN の行は "Flags [F.], seq 87, ack 73," の形で、FIN はシーケンス番号を 1 つ使うので、
+# クライアントの ACK は 88 になる。カーネルの TCP が、自作スタックの FIN の番号を受け入れたことになる
+our_fin_acked() {
+  dump '$3 == server && $7 ~ /F/ && $8 == "seq" && !have_fin { fin = $9 + 0; have_fin = 1 }
+        have_fin && index($3, client ".") == 1 && $7 ~ /\./ && $7 !~ /S/ {
+          for (i = 8; i < NF; i++) if ($i == "ack" && $(i + 1) + 0 == fin + 1) found = 1
+        }
+        END { exit !found }'
+}
+
+# クライアントの FIN に、その次の番号の ACK を返した (RFC 9293 3.10.7.4 Eighth)
+peer_fin_acked() {
+  dump 'index($3, client ".") == 1 && $7 ~ /F/ && $8 == "seq" && !have_fin { fin = $9 + 0; have_fin = 1 }
+        have_fin && $3 == server && $7 ~ /\./ {
+          for (i = 8; i < NF; i++) if ($i == "ack" && $(i + 1) + 0 == fin + 1) found = 1
+        }
+        END { exit !found }'
+}
+
+# クライアントが終わったあとの ss -tn に、自作スタック宛ての接続が残っていない (M7 の完了条件)。
+# ss が見せるのはカーネル側のソケットなので、カーネルの TCP が「この接続は終わった」と判断したことになる。
+# 自作スタックが FIN を返さなければ FIN-WAIT-2 が、FIN に ACK を返さなければ FIN-WAIT-1 か LAST-ACK が残る。
+# ss -tn は TIME-WAIT を出さない (e2e.sh の record_ss を参照)
+# ss -tn の 1 行は: $1 State  $2 Recv-Q  $3 Send-Q  $4 Local Address:Port  $5 Peer Address:Port
+no_leftover() { # $1: ss の記録
+  [[ -s "$1" ]] || return 1
+  awk -v server="$SERVER:$PORT" '$5 == server { found = 1 } END { exit found }' "$1"
+}
+
+# 2 本目 (つないで、何も送らずに閉じる) の検査は、記録を差し替えて同じ関数を使う
+in_close_dump() {
+  local DUMP="$OUT/tcpdump-close.txt"
+  [[ -s "$DUMP" ]] || return 1
+  "$@"
+}
+
 echo "--- 検証 ---"
 check "クライアントの SYN が届いた" syn_recorded
 check "SYN|ACK を返し、ACK 番号が SYN の SEQ + 1 になっている" synack_acks_syn
 check "クライアントが SYN|ACK に ACK を返した (handshake の完了)" client_completes_handshake
 check "RST が流れていない" no_rst
 check "クライアントのデータに、その末尾までの ACK を返した" data_acked
-check "curl の最中に、ss -tn に ESTAB かそのあとの状態の接続が出ている" ss_estab
 check "クライアントが、レスポンスのデータの末尾までを ACK した" response_acked
 check "curl が、決まった HTTP レスポンスの本文を受け取った" body_received
+check "curl が終了コード 0 で終わった" curl_succeeded
+check "自作スタックが FIN を送り、クライアントがそれを ACK した" our_fin_acked
+check "クライアントの FIN に ACK を返した" peer_fin_acked
+check "curl のあと、ss -tn に接続が残っていない" no_leftover "$OUT/ss.txt"
+echo "--- 検証 (2 本目: クライアントが先に閉じる) ---"
+check "クライアントの FIN に ACK を返した" in_close_dump peer_fin_acked
+check "自作スタックが FIN を送り、クライアントがそれを ACK した" in_close_dump our_fin_acked
+check "RST が流れていない" in_close_dump no_rst
+check "クライアントのあと、ss -tn に接続が残っていない" no_leftover "$OUT/ss-close.txt"
 
 exit "$fail"

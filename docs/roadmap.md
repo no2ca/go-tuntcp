@@ -31,11 +31,12 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
 
 ## 現在の状態（2026-11-13）
 
-- M0〜6（実機確認の自動化、TUN、IPv4、TCP ヘッダ、handshake、データの送受信）は完了。M7 は T7-0 まで済み。次は T7-1
-- `curl` が仮のデモ（`cmd/tuntcp` の `demoServer`）から固定の HTTP レスポンスを受け取り、終了コード 0 で終わる
-- FIN はまだ扱わない（T7-3）。`curl` が閉じたあと、カーネルは FIN を再送し続け、`ss -tn` には `FIN-WAIT-1` が残る
+- M0〜7（実機確認の自動化、TUN、IPv4、TCP ヘッダ、handshake、データの送受信、切断）は完了。次は T8-1（API とパッケージの形を、人間が決める）
+- `curl` が仮のデモ（`cmd/tuntcp` の `demoServer`）から固定の HTTP レスポンスを受け取り、終了コード 0 で終わる。デモはレスポンスのあとに閉じ、`ss -tn` に接続が残らない
+- 再送はまだない（M9）。FIN や ACK が落ちると、切断が途中で止まる
 - `task test` はすべて通る
-- `task e2e` は sudo なしで動き、handshake、データへの ACK、`ss -tn` の確立、レスポンスへの ACK、`curl` が受け取った本文を検証して終了コードで返す
+- `task e2e` は sudo なしで動き、handshake、データへの ACK、レスポンスへの ACK、`curl` が受け取った本文と終了コード、両方の向きの切断、`ss -tn` に接続が残らないことを検証して終了コードで返す
+- M7 で AI が決めた仕様が、人間の確認待ち（[design.md](design.md) の「対話で決めた仕様」の「切断と時計」）。M7 の抜き取りと予想の確認も、人間の番
 
 ## 完了したマイルストーン
 
@@ -50,7 +51,7 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
   - LISTEN → SYN-RECEIVED → ESTABLISHED の passive open。RFC 9293 3.10.7.4 の First（受理判定）、Second（RST）、Fourth（SYN-RECEIVED での SYN）、Fifth（SYN-RECEIVED での ACK の範囲）、Seventh の最小版（データに ACK を返す。保存はしない）
   - RCV.NXT から始まらないデータは、ACK を返してまるごと捨てる（[design.md](design.md) の「対話で決めた仕様」）
   - 段階ごとの分岐とテストの対応は [internal/stack/README.md](../internal/stack/README.md) にある
-  - `task e2e` が、handshake の成立、データへの ACK、`curl` の最中の `ss -tn` の `ESTAB` を検証する
+  - `task e2e` が、handshake の成立、データへの ACK、`curl` の最中の `ss -tn` の `ESTAB` を検証する（`ss` の検査は M7 で、終わったあとに接続が残らないことの検査に置き換えた）
   - 後回しにしたもの: RFC 5961 の challenge ACK（目標のあと）、RCV.WND が 0 のときの例外（M10）、URG（扱いを決めていない）
 
 - [x] **M6** データの送受信（T6-1〜T6-7）
@@ -61,29 +62,37 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
   - AI が決めた仕様のうち、仮の読み書き口は [design.md](design.md) の「対話で決めた仕様」にあり、人間の確認待ち。送信キューの形は T7-0 で人間が決め直した
   - 後回しにしたもの: 受信バッファと送信バッファの上限、広告ウィンドウを空きから決めること（M10）、ACK を遅らせてデータに相乗りさせること（決めていない）
 
+- [x] **M7** 切断（T7-0〜T7-7）
+  - 完了条件: `task e2e` で `curl` が終了コード 0 で終わり、そのあと `ss -tn` に接続が残らない
+  - 状態と入力ごとの分岐とテストの対応は [internal/stack/README.md](../internal/stack/README.md) にある
+  - 後回しにしたもの: 利用者への通知（相手の FIN で `io.EOF`、RST で `ECONNRESET`。T8-5）、FIN の再送（T9-2）、SYN-RECEIVED での Close（やらない）、TIME-WAIT で新しい SYN を受け付けること（RFC 9293 3.6.1 MAY-2。決めていない）
+  - [x] **T7-0** 送る出口を送信キュー 1 つにまとめる
+    - `Stack.Handle` の戻り値をなくし、返信も送信キューに積む。振る舞いは変えない。FIN とタイマーのテストを、最初からこの形で書くため
+  - [x] **T7-1** 状態の追加（FIN-WAIT-1, FIN-WAIT-2, CLOSING, TIME-WAIT, CLOSE-WAIT, LAST-ACK）と stringer の再生成
+    - `stringer` を取得できなかったので、`state_string.go` は stringer の出力と同じ形に手で作り直した。名前は `TestState_String` が確かめる
+  - [x] **T7-2** 時刻の注入とタイマーの基盤
+    - テストで時間を進められるよう、時計を差し替え可能にする。M9 の再送でも使う（[design.md](design.md) の「これから変えるところ」の 2）
+    - `Stack.Now` で時刻を引き、`Stack.HandleTimeouts` で期限の来たタイマーを処理する。`main` が 1 秒おきに呼ぶ
+    - これだけでは外から見える振る舞いがないので、T7-5 とあわせてテストと実装をコミットした
+  - [x] **T7-3** FIN の受信（Eighth）
+    - RCV.NXT を 1 進めて ACK を返す（FIN もシーケンス番号を 1 消費する）
+    - 状態ごとの遷移: ESTABLISHED → CLOSE-WAIT、FIN-WAIT-1 → CLOSING、FIN-WAIT-2 → TIME-WAIT
+    - FIN-WAIT-1 で受けた FIN が自分の FIN への ACK も運んでいれば、CLOSING ではなく TIME-WAIT に入る（RFC 9293 3.3.2 の Note 2）
+    - FIN-WAIT-1 と FIN-WAIT-2 での遷移は、その状態に入る手段（Close）が要るので T7-4 で実装した
+  - [x] **T7-4** 自分から閉じる（Close）
+    - FIN を送る: ESTABLISHED → FIN-WAIT-1、CLOSE-WAIT → LAST-ACK
+    - 自分の FIN への ACK を受けたときの遷移: FIN-WAIT-1 → FIN-WAIT-2、CLOSING → TIME-WAIT、LAST-ACK → CLOSED
+    - FIN-WAIT-1 と FIN-WAIT-2 で受けるデータと FIN（T7-3 の残り）、各状態での RST もここで実装した
+    - AI が決めた仕様（FIN を別のセグメントで送る、FIN にもウィンドウの空きを求める、など）は [design.md](design.md) の「対話で決めた仕様」にあり、人間の確認待ち
+  - [x] **T7-5** TIME-WAIT の 2MSL タイマー
+    - MSL は RFC 9293 3.4.2 の 2 分。TIME-WAIT に入ってから 4 分で接続を消す。相手の FIN の再送を受けたら数え直す
+  - [x] **T7-6** 異常時に RST を送って接続を捨てる（Abort）
+    - `Connection.Abort`（仮の口）。いまは `main` から呼ばれず、単体テストだけが確かめている。M8 と T9-4 で使う
+  - [x] **T7-7** 仮のデモでレスポンスのあとに閉じ、`task e2e` の検証に `curl` の終了コードと接続の後始末を足す
+    - `curl`（自作スタックが先に閉じる）に加えて、つないで何も送らずに閉じるクライアント（カーネルが先に閉じる）を流し、両方の向きの切断をカーネルの TCP に判定させる
+    - `curl` の最中の `ss -tn` の検査（ESTAB）は外した。接続が 1 ミリ秒ほどで消えるようになり、0.1 秒おきの記録では取れないため。handshake の成立は tcpdump の検査が確かめている
+
 ---
-
-## M7: 切断
-
-完了条件: `task e2e` で `curl` が終了コード 0 で終わり、そのあと `ss -tn` に接続が残らない
-
-- 終了コード 0 は M6 の時点ですでに満たしている（`curl` は Content-Length の分を受け取ると、FIN の返事を待たずに終わる）。残るのは接続の後始末
-
-- [x] **T7-0** 送る出口を送信キュー 1 つにまとめる
-  - `Stack.Handle` の戻り値をなくし、返信も送信キューに積む。振る舞いは変えない。FIN とタイマーのテストを、最初からこの形で書くため
-- [ ] **T7-1** 状態の追加（FIN-WAIT-1, FIN-WAIT-2, CLOSING, TIME-WAIT, CLOSE-WAIT, LAST-ACK）と stringer の再生成
-- [ ] **T7-2** 時刻の注入とタイマーの基盤
-  - テストで時間を進められるよう、時計を差し替え可能にする。M9 の再送でも使う（[design.md](design.md) の「これから変えるところ」の 2）
-- [ ] **T7-3** FIN の受信（Eighth）
-  - RCV.NXT を 1 進めて ACK を返す（FIN もシーケンス番号を 1 消費する）
-  - 状態ごとの遷移: ESTABLISHED → CLOSE-WAIT、FIN-WAIT-1 → CLOSING、FIN-WAIT-2 → TIME-WAIT
-- [ ] **T7-4** 自分から閉じる（Close）
-  - FIN を送る: ESTABLISHED → FIN-WAIT-1、CLOSE-WAIT → LAST-ACK
-  - 自分の FIN への ACK を受けたときの遷移: FIN-WAIT-1 → FIN-WAIT-2、CLOSING → TIME-WAIT、LAST-ACK → CLOSED
-- [ ] **T7-5** TIME-WAIT の 2MSL タイマー
-- [ ] **T7-6** 異常時に RST を送って接続を捨てる（Abort）
-- [ ] **T7-7** 仮のデモでレスポンスのあとに閉じ、`task e2e` の検証に `curl` の終了コードと接続の後始末を足す
-  - 終了コードは `tmp/e2e/curl.exit` に記録済み（T6-7）。検証にはまだ入れていない
 
 ## M8: Socket API（サーバ側）
 
@@ -101,6 +110,7 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
 - [ ] **T8-4** `net.Conn`: `Read` / `Write` / `Close` / `LocalAddr` / `RemoteAddr`
   - `Read` はデータが来るまでブロックする。`Write` は送信バッファに空きができるまでブロックする
   - `Close` は送信バッファの残りを送ってから FIN を送る。呼び出し自体は待たずに返る
+  - `net.Conn` の `Close` は読む向きも閉じる。M7 の `Connection.Close` は RFC の CLOSE（送る向きだけ）なので、読み残しがあるときや、Close のあとにデータが届いたときの扱いを決める（RFC 9293 3.6.1 SHLD-3 は RST を送るとしている。`Connection.Abort` が使える）
 - [ ] **T8-5** エラーの約束
   - 相手の FIN を受け、受信バッファを読み切ったら `Read` は `io.EOF`
   - 相手の RST を受けたら、`Read` と `Write` は `syscall.ECONNRESET` を包んだエラー
