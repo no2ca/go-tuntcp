@@ -3,6 +3,7 @@ package stack
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"go-tuntcp/internal/tcp"
 )
@@ -984,5 +985,192 @@ func TestHandle_RST_ClosesFromClosingStates(t *testing.T) {
 				t.Error("connection still in the table after RST")
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T7-2、T7-5: 時計の注入と TIME-WAIT の 2MSL タイマー (RFC 9293 3.6.1 MUST-13、3.10.8)
+// ---------------------------------------------------------------------------
+
+// fakeClock は、テストが手で進める時計。Stack.Now に差し込む。
+type fakeClock struct{ now time.Time }
+
+func (f *fakeClock) Now() time.Time          { return f.now }
+func (f *fakeClock) advance(d time.Duration) { f.now = f.now.Add(d) }
+
+func newTestStackWithClock() (*Stack, *fakeClock) {
+	s := newTestStack()
+	clk := &fakeClock{now: time.Unix(1_000_000, 0)}
+	s.Now = clk.Now
+	return s, clk
+}
+
+// checkTimeWaitUntil は、いまから d が経つ直前までは接続が TIME-WAIT で残り、
+// ちょうど d が経ったところで消えることを確かめる。時計は d だけ進む。
+func checkTimeWaitUntil(t *testing.T, s *Stack, clk *fakeClock, c *Connection, d time.Duration) {
+	t.Helper()
+	clk.advance(d - time.Nanosecond)
+	s.HandleTimeouts()
+	if s.conns[testKey()] != c || c.State != tcp.StateTimeWait {
+		t.Fatalf("1ns before the deadline: in table = %v, State = %v; want the connection kept in TIME-WAIT",
+			s.conns[testKey()] == c, c.State)
+	}
+	clk.advance(time.Nanosecond)
+	s.HandleTimeouts()
+	if _, ok := s.conns[testKey()]; ok {
+		t.Errorf("at the deadline: connection still in the table, want it deleted")
+	}
+	checkState(t, c, tcp.StateClosed)
+	if segs := takeSent(t, s); len(segs) != 0 {
+		t.Errorf("TIME-WAIT timeout sent %d segments, want 0", len(segs))
+	}
+}
+
+func TestTimeWait_ExpiresAfter2MSL(t *testing.T) {
+	// 3.6.1 MUST-13: 自分から閉じた接続は、TIME-WAIT に 2×MSL のあいだ留まる。
+	// 3.10.8 TIME-WAIT TIMEOUT: 期限が来たら TCB を消して CLOSED にする。
+	// TIME-WAIT に入る 3 つの経路のどれでも、入った時点から 2MSL を数える
+	// (接続を作った時点からではないことを、手前で時計を 1 時間進めて確かめる)
+	tests := []struct {
+		stateSetup
+		final tcp.Header // TIME-WAIT に入るきっかけのセグメント
+	}{
+		{stateSetup{"FIN-WAIT-2, FIN arrives", toFinWait2}, incomingTCP(tcp.FlagFIN|tcp.FlagACK, clientISN+1, testISS+2)},
+		{stateSetup{"CLOSING, ACK of our FIN arrives", toClosing}, incomingTCP(tcp.FlagACK, clientISN+2, testISS+2)},
+		{stateSetup{"FIN-WAIT-1, FIN with ACK of our FIN arrives", toFinWait1}, incomingTCP(tcp.FlagFIN|tcp.FlagACK, clientISN+1, testISS+2)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, clk := newTestStackWithClock()
+			c := tt.setup(t, s)
+			clk.advance(time.Hour)
+			s.Handle(incomingIP(), tt.final, nil)
+			takeSent(t, s)
+			mustState(t, c, tcp.StateTimeWait)
+
+			checkTimeWaitUntil(t, s, clk, c, 2*msl)
+		})
+	}
+}
+
+func TestTimeWait_RetransmittedFIN_RestartsTimer(t *testing.T) {
+	// 3.10.7.4 の TIME-WAIT: "a retransmission of the remote FIN. Acknowledge it, and restart the 2 MSL timeout."
+	// 相手が FIN を再送するのは、こちらの最後の ACK が届いていないとき。ACK を送り直し、
+	// その ACK から 2MSL を数え直す。再送された FIN は、FIN の番号が RCV.NXT-1 のもの
+	// (docs/design.md の「対話で決めた仕様」)
+	withData := func(t *testing.T, s *Stack) *Connection {
+		// 相手の FIN がデータ "hello" と同じセグメントで来た場合。再送もデータ付きになる
+		c := toFinWait2(t, s)
+		s.Handle(incomingIP(), incomingTCP(tcp.FlagFIN|tcp.FlagPSH|tcp.FlagACK, clientISN+1, testISS+2), []byte("hello"))
+		takeSent(t, s)
+		mustState(t, c, tcp.StateTimeWait)
+		return c
+	}
+	tests := []struct {
+		stateSetup
+		payload string
+		wantAck uint32
+	}{
+		{stateSetup{"bare FIN", toTimeWait}, "", clientISN + 2},
+		{stateSetup{"FIN with data", withData}, "hello", clientISN + 7},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, clk := newTestStackWithClock()
+			c := tt.setup(t, s)
+
+			clk.advance(time.Minute)
+			th, _ := mustReply(t, handle(t, s, incomingIP(), incomingTCP(tcp.FlagFIN|tcp.FlagACK, clientISN+1, testISS+2), []byte(tt.payload)))
+			checkSegment(t, th, tcp.FlagACK, testISS+2, tt.wantAck)
+
+			// 数え直していなければ、ここから 2MSL - 1 分で消える
+			checkTimeWaitUntil(t, s, clk, c, 2*msl)
+		})
+	}
+}
+
+func TestTimeWait_FINAtRcvNxt_RestartsTimer(t *testing.T) {
+	// Eighth、TIME-WAIT: "Remain in the TIME-WAIT state. Restart the 2 MSL time-wait timeout."
+	// RCV.NXT から始まる FIN は、相手の誤りでしか来ない (FIN は 1 回しか送れない) が、文面どおりに扱う
+	s, clk := newTestStackWithClock()
+	c := toTimeWait(t, s)
+
+	clk.advance(time.Minute)
+	th, _ := mustReply(t, handle(t, s, incomingIP(), incomingTCP(tcp.FlagFIN|tcp.FlagACK, clientISN+2, testISS+2), nil))
+	checkSegment(t, th, tcp.FlagACK, testISS+2, clientISN+3)
+
+	checkTimeWaitUntil(t, s, clk, c, 2*msl)
+}
+
+func TestTimeWait_OtherSegments_DoNotRestartTimer(t *testing.T) {
+	// 相手の FIN の再送でないセグメントでは、数え直さない。TIME-WAIT に入ってから 1 分後に受け、
+	// 入ってからちょうど 2MSL で消えることを確かめる
+	tests := []struct {
+		name      string
+		flags     tcp.Flag
+		seq       uint32
+		payload   string
+		wantReply bool
+	}{
+		{"acceptable pure ACK", tcp.FlagACK, clientISN + 2, "", false},
+		{"old duplicate data without FIN", tcp.FlagPSH | tcp.FlagACK, clientISN + 1, "x", true},
+		{"FIN two behind RCV.NXT (not the peer's FIN)", tcp.FlagFIN | tcp.FlagACK, clientISN, "", true},
+		{"RST on the retransmitted FIN", tcp.FlagFIN | tcp.FlagRST, clientISN + 1, "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, clk := newTestStackWithClock()
+			c := toTimeWait(t, s)
+
+			clk.advance(time.Minute)
+			reply := handle(t, s, incomingIP(), incomingTCP(tt.flags, tt.seq, testISS+2), []byte(tt.payload))
+			if got := reply != nil; got != tt.wantReply {
+				t.Errorf("reply sent = %v, want %v", got, tt.wantReply)
+			}
+
+			checkTimeWaitUntil(t, s, clk, c, 2*msl-time.Minute)
+		})
+	}
+}
+
+func TestHandleTimeouts_OutsideTimeWait_NothingHappens(t *testing.T) {
+	// 2MSL のタイマーは TIME-WAIT でだけ動く。ほかの状態は、どれだけ時間が経っても消えない。
+	// (FIN-WAIT-2 で相手の FIN を待ち続ける時間に、RFC 9293 は上限を決めていない)
+	for _, tt := range []stateSetup{
+		{"ESTABLISHED", establish},
+		{"FIN-WAIT-2", toFinWait2},
+		{"CLOSE-WAIT", toCloseWait},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, clk := newTestStackWithClock()
+			c := tt.setup(t, s)
+			state := c.State
+
+			clk.advance(24 * time.Hour)
+			s.HandleTimeouts()
+
+			if s.conns[testKey()] != c {
+				t.Error("connection removed from the table")
+			}
+			checkState(t, c, state)
+			if segs := takeSent(t, s); len(segs) != 0 {
+				t.Errorf("sent %d segments, want 0", len(segs))
+			}
+		})
+	}
+}
+
+func TestTimeWait_AfterExpiry_NewSYNAccepted(t *testing.T) {
+	// TIME-WAIT が明けたあとは、同じアドレスとポートの組で新しい接続を受け付ける
+	s, clk := newTestStackWithClock()
+	toTimeWait(t, s)
+	clk.advance(2 * msl)
+	s.HandleTimeouts()
+
+	th, _ := mustReply(t, handle(t, s, incomingIP(), incomingTCP(tcp.FlagSYN, 5000, 0), nil))
+
+	checkSegment(t, th, tcp.FlagSYN|tcp.FlagACK, testISS, 5001)
+	if c := s.conns[testKey()]; c == nil || c.State != tcp.StateSynReceived {
+		t.Errorf("new connection = %v, want one in SYN-RECEIVED", c)
 	}
 }

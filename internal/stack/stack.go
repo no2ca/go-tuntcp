@@ -8,6 +8,7 @@ import (
 	"go-tuntcp/internal/ipv4"
 	"go-tuntcp/internal/tcp"
 	"net/netip"
+	"time"
 )
 
 const (
@@ -348,7 +349,14 @@ type Stack struct {
 	conns     map[connKey]*Connection // 確立中の接続（SYN-RECEIVED以降）
 	ISS       func() uint32           // 初期シーケンス番号の生成
 	out       [][]byte                // 送信キュー。送るパケットはすべてここを通る。TakeOutgoing で取り出す
+	Now       func() time.Time        // 仮 (T7-2)
 }
+
+// 仮 (T7-2、T7-5)
+const msl = 2 * time.Minute
+
+// HandleTimeouts は仮の口 (T7-2)。
+func (s *Stack) HandleTimeouts() {}
 
 func New() *Stack {
 	return &Stack{
