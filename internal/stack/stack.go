@@ -468,7 +468,7 @@ func (s *Stack) Handle(ip ipv4.Header, t tcp.Header, payload []byte) {
 }
 
 // reap は、LISTEN か CLOSED に戻った接続をテーブルから消す (仕様の "delete the TCB")。
-// 接続の状態を変えうる処理 (受信セグメント、タイマー) のあとに呼ぶ。
+// 接続の状態を変えうる処理 (受信セグメント、タイマー、Abort) のあとに呼ぶ。
 // LISTEN はポート単位で listeners が受け持つので、接続を残す必要はない
 func (s *Stack) reap(c *Connection) {
 	if c.State == tcp.StateListen || c.State == tcp.StateClosed {
@@ -681,5 +681,32 @@ func (s *Stack) TakeOutgoing() [][]byte {
 	return out
 }
 
-// Abort は仮の口 (T7-6)。
-func (c *Connection) Abort() error { return nil }
+// Abort は、接続をすぐに捨てる。RFC 9293 3.10.5 ABORT Call に従う。
+// Close と違い、送信バッファに残ったデータは送らず、相手の FIN も待たない。
+//
+// FIN を送り合う前の状態では、<SEQ=SND.NXT><CTL=RST> を送って相手にも捨てさせる。
+// CLOSING、LAST-ACK、TIME-WAIT では、両側とも FIN を送り終えているので、RST を送らずに消す。
+//
+// 送信バッファは空にしない。CLOSED では output が何も送らず、接続はテーブルから消えるので、
+// 残っていても送られない (仕様の "segments queued for transmission ... should be flushed" は、これで満たす)。
+//
+// やっていないこと:
+//   - RST を送ったあと TIME-WAIT に入る (3.5.2 の "The side of a connection issuing a reset should enter
+//     the TIME-WAIT state")。3.10.5 は "Delete the TCB, enter CLOSED state" としていて、節どうしで食い違う。
+//     イベントごとの手順を書いた 3.10.5 に従った (docs/design.md の「対話で決めた仕様」)
+//   - 待っている SEND と RECEIVE への "connection reset" の通知 (未実装。待つ呼び出しがまだない。T8-5)
+//
+// 仮の口。いまは main から呼ばれない。M8 で Listener の Close や、読み残しのある Close で使う。
+// 再送の上限に達したとき (T9-4) にも使う。
+func (c *Connection) Abort() error {
+	switch c.State {
+	case tcp.StateSynReceived, tcp.StateEstablished, tcp.StateFinWait1, tcp.StateFinWait2, tcp.StateCloseWait:
+		c.stack.send(buildSegment(c.Key.Local, c.Key.Remote, tcp.FlagRST, c.Snd.NXT, 0, c.Rcv.WND, nil))
+	case tcp.StateClosing, tcp.StateLastAck, tcp.StateTimeWait:
+	default:
+		return errConnNotExist
+	}
+	c.State = tcp.StateClosed
+	c.stack.reap(c)
+	return nil
+}
