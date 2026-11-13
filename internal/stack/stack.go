@@ -107,6 +107,10 @@ type Connection struct {
 	// 大きさは制限していない (M10)
 	sndBuf bytes.Buffer
 
+	// finSent は、自分の FIN を送ったかどうか。送ったあとは、FIN が SND.NXT-1 を使っている。
+	// Close を呼んでも、送信バッファのデータを送り切るまで FIN は送らないので、状態だけでは分からない
+	finSent bool
+
 	// send は、この接続が送るパケットを Stack の送信キューに積む
 	send func(pkt []byte)
 }
@@ -160,7 +164,8 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 		case tcp.StateSynReceived:
 			// passive open しか無いので、常に LISTEN に戻る
 			c.State = tcp.StateListen
-		case tcp.StateEstablished, tcp.StateCloseWait:
+		default:
+			// 同期済みの状態 (ESTABLISHED から TIME-WAIT まで) は、どれも CLOSED にする
 			c.State = tcp.StateClosed
 		}
 		return nil
@@ -202,7 +207,7 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 		c.Snd.UNA = t.Ack
 		// 仕様どおり、続けて ESTABLISHED の処理を通る
 		fallthrough
-	case tcp.StateEstablished, tcp.StateCloseWait:
+	case tcp.StateEstablished, tcp.StateCloseWait, tcp.StateFinWait1, tcp.StateFinWait2, tcp.StateClosing, tcp.StateLastAck:
 		// ESTABLISHED の処理。CLOSE-WAIT でも同じことをする ("Do the same processing as for the ESTABLISHED state")。
 		// 送ったデータへの ACK を受け、SND.UNA を進め、ACK されたデータを送信バッファから捨てる。
 		// 重複した ACK (SEG.ACK =< SND.UNA) は無視するが、セグメントの処理は続ける
@@ -217,6 +222,8 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 		case tcp.SeqLT(c.Snd.NXT, t.Ack):
 			return buildSegment(c.Key.Local, c.Key.Remote, tcp.FlagACK, c.Snd.NXT, c.Rcv.NXT, c.Rcv.WND, nil)
 		case tcp.SeqLT(c.Snd.UNA, t.Ack):
+			// FIN まで ACK されたときは、捨てる長さが送信バッファの長さより 1 大きい (FIN は送信バッファにない)。
+			// Next は、足りなければ残りをすべて捨てるだけなので、そのまま渡す
 			c.sndBuf.Next(int(t.Ack - c.Snd.UNA))
 			c.Snd.UNA = t.Ack
 		}
@@ -231,6 +238,35 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 			c.Snd.WND = t.Window
 			c.Snd.WL1 = t.Seq
 			c.Snd.WL2 = t.Ack
+		}
+
+		// 自分から閉じたあとの状態では、上の処理に加えて、自分の FIN が ACK されたかを見る。
+		// FIN は最後に送るので、FIN を送り終えていて SND.UNA が SND.NXT に追いついていれば、FIN も ACK されている。
+		// FIN を送る前 (送れないデータが残っている) は、SND.UNA = SND.NXT でも FIN への ACK ではない
+		finAcked := c.finSent && c.Snd.UNA == c.Snd.NXT
+		switch c.State {
+		case tcp.StateFinWait1:
+			// "if the FIN segment is now acknowledged, then enter FIN-WAIT-2 and continue processing in that state"
+			if finAcked {
+				c.State = tcp.StateFinWait2
+			}
+		case tcp.StateFinWait2:
+			// "if the retransmission queue is empty, the user's CLOSE can be acknowledged" は、
+			// 返す相手がいないので何もしない (Close は呼ばれた時点で返っている)
+		case tcp.StateClosing:
+			// "if the ACK acknowledges our FIN, then enter the TIME-WAIT state; otherwise, ignore the segment"
+			if !finAcked {
+				return nil
+			}
+			c.State = tcp.StateTimeWait
+		case tcp.StateLastAck:
+			// "If our FIN is now acknowledged, delete the TCB, enter the CLOSED state, and return."
+			// 相手の FIN には CLOSE-WAIT に入るときに ACK を返してあり、こちらが最後に送るのは FIN なので、
+			// TIME-WAIT で待つ理由がない。Stack.Handle が接続をテーブルから消す
+			if finAcked {
+				c.State = tcp.StateClosed
+				return nil
+			}
 		}
 	}
 
@@ -257,7 +293,8 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 	//   - ウィンドウの右端を越えた分の切り落とし (未実装。ウィンドウを 65535 で固定している間は、
 	//     1 つの IP パケットに入るデータが越えることはない。M10 でウィンドウを動かすときに要る)
 	//   - ACK を遅らせて送信データに相乗りさせる (未実装)
-	if c.State == tcp.StateEstablished && len(payload) > 0 {
+	receiving := c.State == tcp.StateEstablished || c.State == tcp.StateFinWait1 || c.State == tcp.StateFinWait2
+	if receiving && len(payload) > 0 {
 		if t.Seq == c.Rcv.NXT {
 			c.rcvBuf.Write(payload)
 			c.Rcv.NXT += uint32(len(payload))
@@ -288,6 +325,13 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 			case tcp.StateEstablished:
 				// SYN-RECEIVED で受けた FIN もここに来る。Fifth を通った時点で ESTABLISHED になっている
 				c.State = tcp.StateCloseWait
+			case tcp.StateFinWait1:
+				// 自分の FIN がまだ ACK されていない。両側が同時に閉じた (3.6 の Figure 13)。
+				// 仕様の "If our FIN has been ACKed (perhaps in this segment), then enter TIME-WAIT" のほうは、
+				// Fifth で FIN-WAIT-2 に移してあるので、下の FIN-WAIT-2 の分岐を通る
+				c.State = tcp.StateClosing
+			case tcp.StateFinWait2:
+				c.State = tcp.StateTimeWait
 			}
 		}
 		ackNeeded = true
@@ -415,7 +459,7 @@ func (c *Connection) Read(p []byte) int {
 // Write は、p を送信バッファの後ろに積み、送れる分をすぐに送る。
 // RFC 9293 3.10.2 SEND Call に従う。SYN-RECEIVED では積むだけにし、ESTABLISHED になってから送る。
 // CLOSE-WAIT でも送れる (相手が送り終えただけで、こちらからの向きは開いている)。
-// それ以外の状態ではエラーを返す。
+// 自分から閉じたあとの状態と、接続がないときはエラーを返す。
 //
 // 仮の書き込み口。T6-7 のデモで main が呼ぶ。M8 で net.Conn の Write に置き換える。
 // エラーの形 (net.OpError で包むかなど) は T8-5 で決める。
@@ -428,12 +472,57 @@ func (c *Connection) Write(p []byte) error {
 		c.sndBuf.Write(p)
 		c.output()
 		return nil
+	case tcp.StateFinWait1, tcp.StateFinWait2, tcp.StateClosing, tcp.StateLastAck, tcp.StateTimeWait:
+		// Close を呼んだあと。FIN より後ろにデータは送れない
+		return errConnClosing
 	default:
 		return errConnNotExist
 	}
 }
 
-var errConnNotExist = errors.New("connection does not exist")
+// 利用者の呼び出しに返すエラー。文言は RFC 9293 3.10 の "error: ..." に合わせてある。
+// エラーの形 (net.OpError で包むかなど) は T8-5 で決める。
+var (
+	errConnNotExist = errors.New("connection does not exist")
+	errConnClosing  = errors.New("connection closing")
+	// RFC にはないエラー。SYN-RECEIVED での Close を実装していないことを表す
+	errCloseNotSupported = errors.New("close in SYN-RECEIVED is not supported")
+)
+
+// Close は、これ以上送るデータがないことを相手に伝える (FIN を送る)。RFC 9293 3.10.4 CLOSE Call に従う。
+// 受け取る向きは閉じない。相手が FIN を送ってくるまで、Read で読み出せる (3.6)。
+//
+// FIN は、送信バッファのデータを送り切ったあとに送る ("Queue this until all preceding SENDs have been
+// segmentized")。状態は、FIN を送る前でもここで移す。ESTABLISHED は FIN-WAIT-1 に、CLOSE-WAIT は LAST-ACK に。
+// CLOSE-WAIT について、仕様の文面は「FIN を送ってから LAST-ACK に入る」と読めるが、ESTABLISHED の
+// "In any case, enter FIN-WAIT-1 state" と同じ扱いにした (docs/design.md の「対話で決めた仕様」)。
+// 捨てた案: FIN を送るまで CLOSE-WAIT に留め、Close 済みかどうかを別のフラグで持つ。
+// Write を断るかどうかが、状態だけでは決まらなくなる。
+//
+// やっていないこと:
+//   - SYN-RECEIVED での Close (意図して省いた。仕様は、送るデータがなければすぐ FIN を送って FIN-WAIT-1 に、
+//     あれば ESTABLISHED まで待つとしている。M8 の Accept は ESTABLISHED の接続だけを返すので、
+//     利用者が SYN-RECEIVED の接続を閉じる場面がない。エラーを返し、何も変えない)
+//
+// 仮の口。M8 で net.Conn の Close に置き換える。
+func (c *Connection) Close() error {
+	switch c.State {
+	case tcp.StateEstablished:
+		c.State = tcp.StateFinWait1
+	case tcp.StateCloseWait:
+		c.State = tcp.StateLastAck
+	case tcp.StateSynReceived:
+		return errCloseNotSupported
+	case tcp.StateFinWait1, tcp.StateFinWait2, tcp.StateClosing, tcp.StateLastAck, tcp.StateTimeWait:
+		// すでに閉じている。FIN-WAIT-1 と FIN-WAIT-2 について、仕様は "ok" を返すことも認めているが、
+		// ほかの状態と揃えてエラーにする。どちらでも 2 つ目の FIN は送らない
+		return errConnClosing
+	default:
+		return errConnNotExist
+	}
+	c.output()
+	return nil
+}
 
 // output は、送信バッファのうちまだ送っていない部分を、送ってよい分だけセグメントに切り出して
 // 送信キューに積み、SND.NXT を進める。Write のあとと、受信セグメントを処理したあとに呼ぶ。
@@ -453,6 +542,12 @@ var errConnNotExist = errors.New("connection does not exist")
 func (c *Connection) output() {
 	switch c.State {
 	case tcp.StateEstablished, tcp.StateCloseWait:
+	case tcp.StateFinWait1, tcp.StateClosing, tcp.StateLastAck:
+		// Close のあと、自分の FIN がまだ ACK されていない状態。FIN を送ったら、もう送るものはない。
+		// FIN のあとは SND.NXT - SND.UNA に FIN の 1 が含まれ、下の送信バッファの計算と合わなくなる
+		if c.finSent {
+			return
+		}
 	default:
 		return
 	}
@@ -462,17 +557,31 @@ func (c *Connection) output() {
 		unsent := c.sndBuf.Len() - sent
 		// 相手がウィンドウを縮めると、SND.NXT が右端を越えていることがある。そのときは負になる
 		usable := int(int32(c.Snd.UNA + uint32(c.Snd.WND) - c.Snd.NXT))
-		n := min(unsent, usable, defaultSendMSS)
-		if n <= 0 {
-			return
+		if n := min(unsent, usable, defaultSendMSS); n > 0 {
+			flags := tcp.FlagACK
+			if n == unsent {
+				flags |= tcp.FlagPSH
+			}
+			data := c.sndBuf.Bytes()[sent : sent+n]
+			c.send(buildSegment(c.Key.Local, c.Key.Remote, flags, c.Snd.NXT, c.Rcv.NXT, c.Rcv.WND, data))
+			c.Snd.NXT += uint32(n)
+			continue
 		}
-		flags := tcp.FlagACK
-		if n == unsent {
-			flags |= tcp.FlagPSH
+
+		// 送れるデータがなくなった。Close 済みで、データをすべて送り終えていれば、FIN を送る
+		// (RFC 9293 3.10.4)。<SEQ=SND.NXT><ACK=RCV.NXT><CTL=FIN,ACK> (3.6 の Figure 12)。
+		// FIN もシーケンス番号を 1 つ使うので、相手のウィンドウに 1 つ分の空きがあるときだけ送る。
+		// ウィンドウの外の FIN は、相手の First の検査 (Table 6) で受理されない
+		// (docs/design.md の「対話で決めた仕様」)。
+		// 捨てた案: 最後のデータのセグメントに FIN を載せる。セグメントは 1 つ減るが、
+		// データと FIN の両方が収まるかどうかの分岐が増える
+		closed := c.State == tcp.StateFinWait1 || c.State == tcp.StateClosing || c.State == tcp.StateLastAck
+		if closed && unsent == 0 && usable >= 1 {
+			c.send(buildSegment(c.Key.Local, c.Key.Remote, tcp.FlagFIN|tcp.FlagACK, c.Snd.NXT, c.Rcv.NXT, c.Rcv.WND, nil))
+			c.Snd.NXT++
+			c.finSent = true
 		}
-		data := c.sndBuf.Bytes()[sent : sent+n]
-		c.send(buildSegment(c.Key.Local, c.Key.Remote, flags, c.Snd.NXT, c.Rcv.NXT, c.Rcv.WND, data))
-		c.Snd.NXT += uint32(n)
+		return
 	}
 }
 
@@ -484,10 +593,3 @@ func (s *Stack) TakeOutgoing() [][]byte {
 	s.out = nil
 	return out
 }
-
-// Close は仮の口 (T7-4)。
-func (c *Connection) Close() error { return nil }
-
-var errConnClosing = errors.New("connection closing")
-
-var errCloseNotSupported = errors.New("close in SYN-RECEIVED is not supported")

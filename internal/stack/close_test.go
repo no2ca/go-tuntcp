@@ -671,6 +671,19 @@ func TestHandle_FinWait1_DataACKedButNotFIN_StaysFinWait1(t *testing.T) {
 	}
 }
 
+func TestHandle_FinWait2_ACKForUnsentData_DropsSegment(t *testing.T) {
+	// Fifth、FIN-WAIT-2: "In addition to the processing for the ESTABLISHED state"。
+	// まだ送っていない範囲への ACK (SEG.ACK > SND.NXT) は、ACK を返してセグメントごと捨てる。
+	// 捨てるので、載っている FIN も処理しない (RCV.NXT は進まず、TIME-WAIT にも入らない)
+	s := newTestStack()
+	c := toFinWait2(t, s)
+
+	th, _ := mustReply(t, handle(t, s, incomingIP(), incomingTCP(tcp.FlagFIN|tcp.FlagACK, clientISN+1, testISS+3), nil))
+
+	checkSegment(t, th, tcp.FlagACK, testISS+2, clientISN+1)
+	checkState(t, c, tcp.StateFinWait2)
+}
+
 func TestHandle_Closing_ACK(t *testing.T) {
 	// Fifth、CLOSING: 自分の FIN が ACK されたら TIME-WAIT に入る。そうでなければセグメントを無視する。
 	// toClosing のあとは RCV.NXT = clientISN+2、SND.UNA = testISS+1、SND.NXT = testISS+2

@@ -80,9 +80,11 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
   - 状態ごとの遷移: ESTABLISHED → CLOSE-WAIT、FIN-WAIT-1 → CLOSING、FIN-WAIT-2 → TIME-WAIT
   - FIN-WAIT-1 で受けた FIN が自分の FIN への ACK も運んでいれば、CLOSING ではなく TIME-WAIT に入る（RFC 9293 3.3.2 の Note 2）
   - FIN-WAIT-1 と FIN-WAIT-2 での遷移は、その状態に入る手段（Close）が要るので T7-4 で実装した
-- [ ] **T7-4** 自分から閉じる（Close）
+- [x] **T7-4** 自分から閉じる（Close）
   - FIN を送る: ESTABLISHED → FIN-WAIT-1、CLOSE-WAIT → LAST-ACK
   - 自分の FIN への ACK を受けたときの遷移: FIN-WAIT-1 → FIN-WAIT-2、CLOSING → TIME-WAIT、LAST-ACK → CLOSED
+  - FIN-WAIT-1 と FIN-WAIT-2 で受けるデータと FIN（T7-3 の残り）、各状態での RST もここで実装した
+  - AI が決めた仕様（FIN を別のセグメントで送る、FIN にもウィンドウの空きを求める、など）は [design.md](design.md) の「対話で決めた仕様」にあり、人間の確認待ち
 - [ ] **T7-5** TIME-WAIT の 2MSL タイマー
 - [ ] **T7-6** 異常時に RST を送って接続を捨てる（Abort）
 - [ ] **T7-7** 仮のデモでレスポンスのあとに閉じ、`task e2e` の検証に `curl` の終了コードと接続の後始末を足す
