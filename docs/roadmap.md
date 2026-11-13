@@ -73,8 +73,10 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
   - `Stack.Handle` の戻り値をなくし、返信も送信キューに積む。振る舞いは変えない。FIN とタイマーのテストを、最初からこの形で書くため
 - [x] **T7-1** 状態の追加（FIN-WAIT-1, FIN-WAIT-2, CLOSING, TIME-WAIT, CLOSE-WAIT, LAST-ACK）と stringer の再生成
   - `stringer` を取得できなかったので、`state_string.go` は stringer の出力と同じ形に手で作り直した。名前は `TestState_String` が確かめる
-- [ ] **T7-2** 時刻の注入とタイマーの基盤
+- [x] **T7-2** 時刻の注入とタイマーの基盤
   - テストで時間を進められるよう、時計を差し替え可能にする。M9 の再送でも使う（[design.md](design.md) の「これから変えるところ」の 2）
+  - `Stack.Now` で時刻を引き、`Stack.HandleTimeouts` で期限の来たタイマーを処理する。`main` が 1 秒おきに呼ぶ
+  - これだけでは外から見える振る舞いがないので、T7-5 とあわせてテストと実装をコミットした
 - [x] **T7-3** FIN の受信（Eighth）
   - RCV.NXT を 1 進めて ACK を返す（FIN もシーケンス番号を 1 消費する）
   - 状態ごとの遷移: ESTABLISHED → CLOSE-WAIT、FIN-WAIT-1 → CLOSING、FIN-WAIT-2 → TIME-WAIT
@@ -85,7 +87,8 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
   - 自分の FIN への ACK を受けたときの遷移: FIN-WAIT-1 → FIN-WAIT-2、CLOSING → TIME-WAIT、LAST-ACK → CLOSED
   - FIN-WAIT-1 と FIN-WAIT-2 で受けるデータと FIN（T7-3 の残り）、各状態での RST もここで実装した
   - AI が決めた仕様（FIN を別のセグメントで送る、FIN にもウィンドウの空きを求める、など）は [design.md](design.md) の「対話で決めた仕様」にあり、人間の確認待ち
-- [ ] **T7-5** TIME-WAIT の 2MSL タイマー
+- [x] **T7-5** TIME-WAIT の 2MSL タイマー
+  - MSL は RFC 9293 3.4.2 の 2 分。TIME-WAIT に入ってから 4 分で接続を消す。相手の FIN の再送を受けたら数え直す
 - [ ] **T7-6** 異常時に RST を送って接続を捨てる（Abort）
 - [ ] **T7-7** 仮のデモでレスポンスのあとに閉じ、`task e2e` の検証に `curl` の終了コードと接続の後始末を足す
   - 終了コードは `tmp/e2e/curl.exit` に記録済み（T6-7）。検証にはまだ入れていない

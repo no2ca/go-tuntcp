@@ -112,8 +112,55 @@ type Connection struct {
 	// Close を呼んでも、送信バッファのデータを送り切るまで FIN は送らないので、状態だけでは分からない
 	finSent bool
 
-	// send は、この接続が送るパケットを Stack の送信キューに積む
-	send func(pkt []byte)
+	// timeWait は TIME-WAIT の 2MSL タイマー。TIME-WAIT に入るときに動かす
+	timeWait timer
+
+	// stack は、この接続を持つ Stack。送るパケットを送信キューに積むときと、いまの時刻を得るときに使う
+	stack *Stack
+}
+
+// timer は、期限を 1 つ持つタイマー。ゼロ値は止まっている。
+// 自分では時間を測らない。動かすときと、期限が来たかを見るときに、Stack.Now で得た時刻を渡す。
+// 期限が来たかは、Stack.HandleTimeouts が呼ばれたときに調べる。
+type timer struct {
+	deadline time.Time
+	running  bool
+}
+
+func (t *timer) start(now time.Time, d time.Duration) {
+	t.deadline = now.Add(d)
+	t.running = true
+}
+
+func (t *timer) expired(now time.Time) bool {
+	return t.running && !now.Before(t.deadline)
+}
+
+// msl は Maximum Segment Lifetime。セグメントがネットワークの中に残りうる時間の上限。
+// RFC 9293 3.4.2: "For this specification the MSL is taken to be 2 minutes."
+const msl = 2 * time.Minute
+
+// enterTimeWait は、TIME-WAIT に入り、2MSL のタイマーを動かす
+// (RFC 9293 3.10.7.4 の "enter the TIME-WAIT state, start the time-wait timer"、3.6.1 MUST-13)。
+//
+// やっていないこと:
+//   - "turn off the other timers" (未実装。ほかのタイマーがまだない。再送タイマーは M9)
+func (c *Connection) enterTimeWait() {
+	c.State = tcp.StateTimeWait
+	c.timeWait.start(c.stack.Now(), 2*msl)
+}
+
+// timeouts は、期限の来たタイマーを処理する。RFC 9293 3.10.8 (Timeouts)。Stack.HandleTimeouts が呼ぶ。
+//
+// やっていないこと:
+//   - USER TIMEOUT (未実装。扱いを決めていない)
+//   - RETRANSMISSION TIMEOUT (未実装。M9)
+func (c *Connection) timeouts(now time.Time) {
+	// TIME-WAIT TIMEOUT: "delete the TCB, enter the CLOSED state"。
+	// CLOSED にしておけば、Stack.HandleTimeouts が接続をテーブルから消す
+	if c.timeWait.expired(now) {
+		c.State = tcp.StateClosed
+	}
 }
 
 // Handle は、この接続に届いたセグメントを 1 つ処理する。Stack.Handle が呼ぶ。
@@ -124,7 +171,7 @@ type Connection struct {
 // 送るデータのセグメントにも ACK = RCV.NXT が載るので、セグメントの処理を終えてから送る。
 func (c *Connection) Handle(t tcp.Header, payload []byte) {
 	if reply := c.segmentArrives(t, payload); reply != nil {
-		c.send(reply)
+		c.stack.send(reply)
 	}
 	c.output()
 }
@@ -146,6 +193,15 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 	if !tcp.SegmentAcceptable(t.Seq, segmentLength(t, len(payload)), c.Rcv.NXT, c.Rcv.WND) {
 		if t.HasFlag(tcp.FlagRST) {
 			return nil
+		}
+		// TIME-WAIT で相手の FIN の再送を受けたら、下の ACK を返すのに加えて、2MSL を数え直す。
+		// 仕様は Fifth と Eighth の TIME-WAIT に "a retransmission of the remote FIN. Acknowledge it, and
+		// restart the 2 MSL timeout" と書いているが、再送された FIN は SEG.SEQ が RCV.NXT の手前なので、
+		// ここ (First) で受理できずに終わり、Fifth と Eighth には届かない。仕様の意図を、届く場所で実装する
+		// (docs/design.md の「対話で決めた仕様」)。
+		// 相手の FIN の再送と見なすのは、FIN の番号 (SEG.SEQ + データ長) が RCV.NXT-1 のものだけ
+		if c.State == tcp.StateTimeWait && t.HasFlag(tcp.FlagFIN) && t.Seq+uint32(len(payload)) == c.Rcv.NXT-1 {
+			c.timeWait.start(c.stack.Now(), 2*msl)
 		}
 		return buildSegment(c.Key.Local, c.Key.Remote, tcp.FlagACK, c.Snd.NXT, c.Rcv.NXT, c.Rcv.WND, nil)
 	}
@@ -259,7 +315,7 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 			if !finAcked {
 				return nil
 			}
-			c.State = tcp.StateTimeWait
+			c.enterTimeWait()
 		case tcp.StateLastAck:
 			// "If our FIN is now acknowledged, delete the TCB, enter the CLOSED state, and return."
 			// 相手の FIN には CLOSE-WAIT に入るときに ACK を返してあり、こちらが最後に送るのは FIN なので、
@@ -269,6 +325,10 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 				return nil
 			}
 		}
+	case tcp.StateTimeWait:
+		// 送ったものはすべて ACK されているので、ACK の処理はしない。ACK だけのセグメントに ACK を返すこともしない
+		// (両側が TIME-WAIT のとき、応酬が止まらなくなる)。
+		// 仕様がここに書いている「相手の FIN の再送に ACK を返し、2MSL を数え直す」は、First でやっている
 	}
 
 	// RFC 9293 3.10.7.4 Sixth: URG は未実装。扱いを決めていない。
@@ -332,8 +392,12 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 				// Fifth で FIN-WAIT-2 に移してあるので、下の FIN-WAIT-2 の分岐を通る
 				c.State = tcp.StateClosing
 			case tcp.StateFinWait2:
-				c.State = tcp.StateTimeWait
+				c.enterTimeWait()
+			case tcp.StateTimeWait:
+				// "Remain in the TIME-WAIT state. Restart the 2 MSL time-wait timeout."
+				c.timeWait.start(c.stack.Now(), 2*msl)
 			}
+			// CLOSE-WAIT、CLOSING、LAST-ACK は "Remain"
 		}
 		ackNeeded = true
 	}
@@ -349,20 +413,15 @@ type Stack struct {
 	conns     map[connKey]*Connection // 確立中の接続（SYN-RECEIVED以降）
 	ISS       func() uint32           // 初期シーケンス番号の生成
 	out       [][]byte                // 送信キュー。送るパケットはすべてここを通る。TakeOutgoing で取り出す
-	Now       func() time.Time        // 仮 (T7-2)
+	Now       func() time.Time        // いまの時刻。タイマーの期限を決めるときと、期限が来たかを見るときに呼ぶ
 }
-
-// 仮 (T7-2、T7-5)
-const msl = 2 * time.Minute
-
-// HandleTimeouts は仮の口 (T7-2)。
-func (s *Stack) HandleTimeouts() {}
 
 func New() *Stack {
 	return &Stack{
 		listeners: make(map[uint16]struct{}),
 		conns:     make(map[connKey]*Connection),
 		ISS:       randomISS,
+		Now:       time.Now,
 	}
 }
 
@@ -399,16 +458,36 @@ func (s *Stack) Handle(ip ipv4.Header, t tcp.Header, payload []byte) {
 	// 既存の接続
 	if c, ok := s.conns[key]; ok {
 		c.Handle(t, payload)
-		// LISTEN か CLOSED に戻った接続はテーブルから消す。
-		// LISTEN はポート単位で listeners が受け持つので、接続を残す必要はない
-		if c.State == tcp.StateListen || c.State == tcp.StateClosed {
-			delete(s.conns, key)
-		}
+		s.reap(c)
 		return
 	}
 
 	if reply := s.segmentArrivesNoConn(key, ip, t, payload); reply != nil {
 		s.send(reply)
+	}
+}
+
+// reap は、LISTEN か CLOSED に戻った接続をテーブルから消す (仕様の "delete the TCB")。
+// 接続の状態を変えうる処理 (受信セグメント、タイマー) のあとに呼ぶ。
+// LISTEN はポート単位で listeners が受け持つので、接続を残す必要はない
+func (s *Stack) reap(c *Connection) {
+	if c.State == tcp.StateListen || c.State == tcp.StateClosed {
+		delete(s.conns, c.Key)
+	}
+}
+
+// HandleTimeouts は、期限の来たタイマーを処理する。RFC 9293 3.10.8 (Timeouts)。
+// 呼ばれた時点の Now と期限を比べるので、呼ぶ間隔がタイマーの粒度になる。
+// main が一定の間隔で呼び、続けて TakeOutgoing で取り出して TUN に書く
+// (いまあるタイマーは何も送らないが、M9 の再送タイマーは送る)。
+//
+// 時刻を Handle や HandleTimeouts の引数で渡さず、Now で引くのは、Close や Write のような
+// 利用者の呼び出しもタイマーを動かすようになる (M9 の再送) ため。呼び出しごとに時刻を渡させない。
+func (s *Stack) HandleTimeouts() {
+	now := s.Now()
+	for _, c := range s.conns {
+		c.timeouts(now)
+		s.reap(c)
 	}
 }
 
@@ -431,7 +510,7 @@ func (s *Stack) segmentArrivesNoConn(key connKey, ip ipv4.Header, t tcp.Header, 
 		case t.HasFlag(tcp.FlagACK):
 			return buildRST(ip, t, len(payload))
 		case t.HasFlag(tcp.FlagSYN):
-			c := &Connection{Key: key, send: s.send}
+			c := &Connection{Key: key, stack: s}
 
 			c.Rcv.NXT = t.Seq + 1
 			c.Rcv.IRS = t.Seq
@@ -571,7 +650,7 @@ func (c *Connection) output() {
 				flags |= tcp.FlagPSH
 			}
 			data := c.sndBuf.Bytes()[sent : sent+n]
-			c.send(buildSegment(c.Key.Local, c.Key.Remote, flags, c.Snd.NXT, c.Rcv.NXT, c.Rcv.WND, data))
+			c.stack.send(buildSegment(c.Key.Local, c.Key.Remote, flags, c.Snd.NXT, c.Rcv.NXT, c.Rcv.WND, data))
 			c.Snd.NXT += uint32(n)
 			continue
 		}
@@ -585,7 +664,7 @@ func (c *Connection) output() {
 		// データと FIN の両方が収まるかどうかの分岐が増える
 		closed := c.State == tcp.StateFinWait1 || c.State == tcp.StateClosing || c.State == tcp.StateLastAck
 		if closed && unsent == 0 && usable >= 1 {
-			c.send(buildSegment(c.Key.Local, c.Key.Remote, tcp.FlagFIN|tcp.FlagACK, c.Snd.NXT, c.Rcv.NXT, c.Rcv.WND, nil))
+			c.stack.send(buildSegment(c.Key.Local, c.Key.Remote, tcp.FlagFIN|tcp.FlagACK, c.Snd.NXT, c.Rcv.NXT, c.Rcv.WND, nil))
 			c.Snd.NXT++
 			c.finSent = true
 		}

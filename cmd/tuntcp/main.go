@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"go-tuntcp/internal/ipv4"
 	"go-tuntcp/internal/stack"
@@ -39,10 +40,21 @@ func main() {
 	stk.Listen(80)
 	demo := newDemoServer()
 
+	// タイマーの期限は、Stack.HandleTimeouts を呼んだときに調べられる。いまあるタイマーは
+	// TIME-WAIT の 2MSL (4 分) だけなので、1 秒おきで足りる。再送タイマー (M9) を入れるときに、
+	// 次の期限まで待つ形に変える (M8 のイベントループ)
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-tick.C:
+			stk.HandleTimeouts()
+			for _, pkt := range stk.TakeOutgoing() {
+				send(dev, pkt)
+			}
 		case res := <-ch:
 			packet := res.buf[:res.n]
 			displayRawRx(packet)
