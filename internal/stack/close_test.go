@@ -1174,3 +1174,108 @@ func TestTimeWait_AfterExpiry_NewSYNAccepted(t *testing.T) {
 		t.Errorf("new connection = %v, want one in SYN-RECEIVED", c)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// T7-6: RST を送って接続を捨てる (RFC 9293 3.10.5 ABORT Call)
+// ---------------------------------------------------------------------------
+
+func TestAbort_SendsRST(t *testing.T) {
+	// 3.10.5: SYN-RECEIVED、ESTABLISHED、FIN-WAIT-1、FIN-WAIT-2、CLOSE-WAIT では
+	// <SEQ=SND.NXT><CTL=RST> を送り、TCB を消して CLOSED にする。
+	// SEQ がいまの SND.NXT なので、相手の受信ウィンドウの左端に当たり、相手は RST を受け入れる
+	for _, tt := range []stateSetup{
+		{"SYN-RECEIVED", sendSYN},
+		{"ESTABLISHED", establish},
+		{"FIN-WAIT-1", toFinWait1},
+		{"FIN-WAIT-2", toFinWait2},
+		{"CLOSE-WAIT", toCloseWait},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestStack()
+			c := tt.setup(t, s)
+			sndNXT := c.Snd.NXT
+
+			if err := c.Abort(); err != nil {
+				t.Fatalf("Abort: %v", err)
+			}
+
+			segs := takeSent(t, s)
+			if len(segs) != 1 {
+				t.Fatalf("sent %d segments, want 1 (RST)", len(segs))
+			}
+			checkSegment(t, segs[0].hdr, tcp.FlagRST, sndNXT, 0)
+			checkState(t, c, tcp.StateClosed)
+			if _, ok := s.conns[testKey()]; ok {
+				t.Error("connection still in the table after Abort")
+			}
+		})
+	}
+}
+
+func TestAbort_AfterBothFINs_NoRST(t *testing.T) {
+	// 3.10.5: CLOSING、LAST-ACK、TIME-WAIT では、RST を送らずに TCB を消す。
+	// 両側とも FIN を送り終えていて、捨てて失われるデータがない
+	for _, tt := range afterPeerFIN {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestStack()
+			c := tt.setup(t, s)
+
+			if err := c.Abort(); err != nil {
+				t.Fatalf("Abort: %v", err)
+			}
+
+			if segs := takeSent(t, s); len(segs) != 0 {
+				t.Errorf("sent %d segments, want 0", len(segs))
+			}
+			checkState(t, c, tcp.StateClosed)
+			if _, ok := s.conns[testKey()]; ok {
+				t.Error("connection still in the table after Abort")
+			}
+		})
+	}
+}
+
+func TestAbort_UnsentData_OnlyRST(t *testing.T) {
+	// 3.10.5: "all segments queued for transmission (except for the RST formed above) ... should be flushed"。
+	// ウィンドウが足りずに送れなかったデータは送らない。RST の SEQ は、送り終えたところ (SND.NXT)
+	s := newTestStack()
+	c := establishWithWindow(t, s, 5)
+	c.Write([]byte("hello world"))
+	takeSent(t, s) // "hello"
+
+	if err := c.Abort(); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+
+	segs := takeSent(t, s)
+	if len(segs) != 1 {
+		t.Fatalf("sent %d segments, want 1 (RST)", len(segs))
+	}
+	checkSegment(t, segs[0].hdr, tcp.FlagRST, testISS+6, 0)
+	if len(segs[0].payload) != 0 {
+		t.Errorf("payload = %q, want empty", segs[0].payload)
+	}
+}
+
+func TestAbort_Closed_ReturnsError(t *testing.T) {
+	// 3.10.5、CLOSED: "error: connection does not exist"。Abort のあとの Write と Close も同じ
+	s := newTestStack()
+	c := establish(t, s)
+	if err := c.Abort(); err != nil {
+		t.Fatalf("first Abort: %v", err)
+	}
+	takeSent(t, s)
+
+	if err := c.Abort(); !errors.Is(err, errConnNotExist) {
+		t.Errorf("second Abort: err = %v, want %v", err, errConnNotExist)
+	}
+	if err := c.Write([]byte("hello")); !errors.Is(err, errConnNotExist) {
+		t.Errorf("Write after Abort: err = %v, want %v", err, errConnNotExist)
+	}
+	if err := c.Close(); !errors.Is(err, errConnNotExist) {
+		t.Errorf("Close after Abort: err = %v, want %v", err, errConnNotExist)
+	}
+	if segs := takeSent(t, s); len(segs) != 0 {
+		t.Errorf("sent %d segments on a closed connection, want 0", len(segs))
+	}
+}

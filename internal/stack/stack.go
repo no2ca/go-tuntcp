@@ -680,3 +680,6 @@ func (s *Stack) TakeOutgoing() [][]byte {
 	s.out = nil
 	return out
 }
+
+// Abort は仮の口 (T7-6)。
+func (c *Connection) Abort() error { return nil }
