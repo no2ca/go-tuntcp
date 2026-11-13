@@ -71,7 +71,8 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
 
 - [x] **T7-0** 送る出口を送信キュー 1 つにまとめる
   - `Stack.Handle` の戻り値をなくし、返信も送信キューに積む。振る舞いは変えない。FIN とタイマーのテストを、最初からこの形で書くため
-- [ ] **T7-1** 状態の追加（FIN-WAIT-1, FIN-WAIT-2, CLOSING, TIME-WAIT, CLOSE-WAIT, LAST-ACK）と stringer の再生成
+- [x] **T7-1** 状態の追加（FIN-WAIT-1, FIN-WAIT-2, CLOSING, TIME-WAIT, CLOSE-WAIT, LAST-ACK）と stringer の再生成
+  - `stringer` を取得できなかったので、`state_string.go` は stringer の出力と同じ形に手で作り直した。名前は `TestState_String` が確かめる
 - [ ] **T7-2** 時刻の注入とタイマーの基盤
   - テストで時間を進められるよう、時計を差し替え可能にする。M9 の再送でも使う（[design.md](design.md) の「これから変えるところ」の 2）
 - [ ] **T7-3** FIN の受信（Eighth）
