@@ -484,3 +484,10 @@ func (s *Stack) TakeOutgoing() [][]byte {
 	s.out = nil
 	return out
 }
+
+// Close は仮の口 (T7-4)。
+func (c *Connection) Close() error { return nil }
+
+var errConnClosing = errors.New("connection closing")
+
+var errCloseNotSupported = errors.New("close in SYN-RECEIVED is not supported")
