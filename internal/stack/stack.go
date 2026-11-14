@@ -711,6 +711,13 @@ func (c *Connection) Abort() error {
 	return nil
 }
 
-// AbortAll は、残っているすべての接続を Abort で捨てる。
+// AbortAll は、残っているすべての接続を Abort で捨てる (RFC 9293 3.10.5)。
+// スタックを止めるときに tuntcp.Stack.Close が呼び、続けて TakeOutgoing で RST を取り出して書く。
+// 相手に半端な接続を残さないため (docs/design.md の「対話で決めた仕様」の「API とパッケージの形」)。
+// 接続が複数あるとき、RST を積む順番は決まっていない。
 func (s *Stack) AbortAll() {
+	for _, c := range s.conns {
+		// テーブルにあるのは SYN-RECEIVED 以降の接続だけなので、Abort は "connection does not exist" を返さない
+		_ = c.Abort()
+	}
 }

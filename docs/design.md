@@ -69,7 +69,8 @@ flowchart LR
 | 18 | 切断する。FIN を送って閉じ、相手の FIN を受け、TIME-WAIT を 2MSL で終える。RST を送って捨てる | RFC 9293 3.6、3.10.4、3.10.5、3.10.7.4 Eighth、3.10.8 | `Connection.Close`、`Connection.Abort`（どちらも仮の口）、`Stack.HandleTimeouts`、`Stack.Now` | `TestClose_*`、`TestAbort_*`、`TestTimeWait_*`、`task e2e` の検証（両方の向きの切断、`ss -tn` に残らない） | 済。`Abort` は実機で確かめていない。利用者への通知は未（T8-5） |
 | 19 | 受信と送信のパケットを画面に表示する | 仕様なし | `cmd/tuntcp` の `display*` | なし | 済 |
 | 20 | 実機で動かし、記録を検証する | [roadmap.md](roadmap.md) の M0 | `scripts/e2e.sh`、`scripts/e2e-check.sh` | 記録を差し替えて、落ちるべきときに落ちることを確かめた | 済 |
-| 21 | Socket API、再送、フロー制御、MSS | [roadmap.md](roadmap.md) の M8〜M11 | — | — | 未 |
+| 21 | イベントループ。デバイスから読んだパケット、タイマー、API の呼び出しを 1 つの goroutine で順に処理し、送信キューをデバイスに書く。`Close` で接続を捨てて止まる | 仕様なし（「対話で決めた仕様」の「API とパッケージの形」） | `tuntcp.New`、`Stack.Listen`、`Stack.Close`、`stack.Stack.AbortAll` | `TestStack_*`（直下の `tuntcp_test.go`）、`TestAbortAll_*` | 一部。`cmd/tuntcp` はまだ使っていない（T8-8）。`Accept` と `net.Conn` は未（T8-3 から） |
+| 22 | 再送、フロー制御、MSS | [roadmap.md](roadmap.md) の M9〜M11 | — | — | 未 |
 
 12 の内訳。RFC 9293 3.10.7.4 の 8 つの段階ごとの状態。
 
@@ -98,7 +99,10 @@ flowchart LR
 - `cmd/tuntcp` が、送ったパケットをもう一度パースしている: 表示のためだけの処理（T6-7 で、パースのエラーを捨てずにログに出すようにした）
 - どのテストも通らない行: `randomISS` の中身（テストは `Stack.ISS` を差し替えるため）、`Stack.Conn`（`main` のデモだけが使う。`task e2e` では通る）
 - `main` が `HandleTimeouts` を呼ぶ間隔の 1 秒: 2MSL が 4 分なので足りる、という以上の根拠がない。`task e2e` は 4 分待たないので、この呼び出しが働くことは記録に残る形では確かめていない（T7-5 で、MSL を一時的に縮めて 1 回だけ手で確かめた）。M8 のイベントループで置き換える
-- `Connection.Abort` は、どこからも呼ばれていない。単体テストだけが通る。M8 と T9-4 で使う
+- `Connection.Abort` は、`Stack.AbortAll`（`tuntcp.Stack.Close`）からだけ呼ばれる。実機では確かめていない。T8-4 と T9-4 でも使う
+- `tuntcp` のループが `HandleTimeouts` を呼ぶ行は、どのテストも通らない。タイマーが外から見えるようになるのは、`Conn.Close` で TIME-WAIT に入れるようになる T8-4。間隔の 1 秒は `main` と同じで、根拠も同じ
+- `tuntcp` は、読めないパケットを黙って捨て、デバイスへの書き込みのエラーも捨てる。デバイスが `Close` 以外の理由で読めなくなっても、利用者に伝えない。どれも扱いを決めていない
+- イベントループが 2 つある: `tuntcp.Stack.run` と、`cmd/tuntcp` の `main`。`main` は仮のデモのために残してあり、T8-8 で `tuntcp` に置き換える
 
 ## パッケージ
 
@@ -108,7 +112,8 @@ flowchart LR
 | `internal/checksum` | インターネットチェックサム（`Sum` / `Fold`） |
 | `internal/ipv4` | IPv4 ヘッダの `Parse` / `Serialize` とチェックサムの検証 |
 | `internal/tcp` | TCP ヘッダの `Parse` / `Serialize`、フラグ、シーケンス番号の比較、状態（`State`）、TCB（`ControlBlock`） |
-| `internal/stack` | 接続の管理と、受信セグメントの処理。分岐ごとの図と表は [README](../internal/stack/README.md) |
+| `tuntcp`（リポジトリの直下。import は `"go-tuntcp"`） | 公開する API。イベントループの goroutine を持ち、デバイスの読み書きと `internal/stack` の呼び出しを 1 本に並べる。`net.Listener` と `net.Conn` は T8-3 から足す |
+| `internal/stack` | 接続の管理と、受信セグメントの処理。並行処理は持たない。分岐ごとの図と表は [README](../internal/stack/README.md) |
 | `cmd/tuntcp` | エントリポイント。TUN を開き、80 番を LISTEN し、パケットを表示しながら `Stack` に渡す。1 秒おきにタイマーを処理させる。HTTP に固定のレスポンスを返して閉じる仮のデモを持つ |
 
 ## internal/stack
@@ -205,6 +210,6 @@ RFC が決めていない、または RFC の推奨から意図して外れた�
 
 1. **送信キュー（M6 と T7-0、済）**: `Stack` が送りたいパケットをキューに積み、`main` がそれを TUN に書く。`Handle` は戻り値を持たず、送るものはすべてキューを通る
 2. **時計の注入（M7、済）**: タイマー（2MSL、再送、persist）のために、時刻を外から渡す（`Stack.Now`）。テストでは時間を手で進める。いまは 2MSL だけ
-3. **イベントループ（M8）**: `Stack` を 1 つの goroutine が持ち、受信セグメント、タイマー、API の呼び出しをチャネルで受ける。`net.Listener` と `net.Conn` のメソッドは、このループに要求を送ってブロックする
+3. **イベントループ（M8。T8-2 でループだけ済）**: `stack.Stack` を 1 つの goroutine（`tuntcp.Stack.run`）が持ち、受信したパケット、タイマー、API の呼び出しをチャネルで受ける。API のメソッドは、ループの上で実行する関数を渡して、終わるまで待つ（`tuntcp.Stack.call`）。`net.Listener` と `net.Conn` のメソッドも、この口を通す（T8-3 から）
 
 接続は「入力（セグメント、タイマーの満了、API の呼び出し）を受けて、TCB を更新し、送るセグメントを出す」状態機械として保つ。この形は 3 つの変更を通して変えない。

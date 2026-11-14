@@ -31,10 +31,11 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
 
 ## 現在の状態（2026-11-14）
 
-- M0〜7（実機確認の自動化、TUN、IPv4、TCP ヘッダ、handshake、データの送受信、切断）は完了。M8 は T8-1（API とパッケージの形）を決めた。次は T8-2（イベントループ）
+- M0〜7（実機確認の自動化、TUN、IPv4、TCP ヘッダ、handshake、データの送受信、切断）は完了。M8 は T8-1（API とパッケージの形）を決めた。T8-2（イベントループ）まで済んだ。次は T8-3（`net.Listener`）
 - `curl` が仮のデモ（`cmd/tuntcp` の `demoServer`）から固定の HTTP レスポンスを受け取り、終了コード 0 で終わる。デモはレスポンスのあとに閉じ、`ss -tn` に接続が残らない
 - 再送はまだない（M9）。FIN や ACK が落ちると、切断が途中で止まる
-- `task test` はすべて通る
+- 公開パッケージ `tuntcp`（リポジトリの直下）にイベントループがある。`cmd/tuntcp` はまだ自前のループと仮のデモで動いていて、`tuntcp` を使うのは T8-8 から
+- `task test` はすべて通る。`go test -race ./...` も通る
 - `task e2e` は sudo なしで動き、handshake、データへの ACK、レスポンスへの ACK、`curl` が受け取った本文と終了コード、両方の向きの切断、`ss -tn` に接続が残らないことを検証して終了コードで返す
 - M6 と M7 で AI が決めた仕様（[design.md](design.md) の「対話で決めた仕様」の「切断と時計」と「仮の読み書き口」）は、2026-11-14 に人間が承認した。M7 の抜き取り（行は [verification-log.md](verification-log.md) に示してある）と予想の確認は、人間の番のまま
 
@@ -103,8 +104,11 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
 - [x] **T8-1** API とパッケージの形を決める
   - 公開するパッケージの名前と置き場所、型の名前、`Stack` の起動と停止の方法。案と理由を示して、人間が決める
   - 決めた内容は [design.md](design.md) の「対話で決めた仕様」の「API とパッケージの形」にある
-- [ ] **T8-2** イベントループ
+- [x] **T8-2** イベントループ
   - `Stack` を 1 つの goroutine が持ち、受信セグメント、タイマー、API の呼び出しをチャネルで受ける（[design.md](design.md) の「これから変えるところ」の 3）
+  - `tuntcp.New` / `Listen` / `Close` と、止めるときにすべての接続を捨てる `stack.Stack.AbortAll` を入れた。`Listen` が返す `Listener` は、まだメソッドを持たない
+  - ループがタイマーを処理する行は、テストが通っていない。`Conn.Close` で TIME-WAIT に入れるようになる T8-4 で確かめる
+  - `tun.Create` が返す `*os.File` は、`Close` しても待っている `Read` が返らないかもしれない（`Fd()` を呼ぶとブロッキングに戻るため）。T8-8 で `cmd/tuntcp` を載せ替えるときに確かめる
 - [ ] **T8-3** `net.Listener`: `Accept` / `Close` / `Addr`
   - ESTABLISHED になった接続を accept キューに積む。キューの上限と、溢れたときの扱いを決める
   - `Close` したら、ブロック中の `Accept` は `net.ErrClosed` で返る

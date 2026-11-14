@@ -238,6 +238,7 @@ LISTEN は接続ごとの状態としては持たない。LISTEN 中のポート
 | SYN-RECEIVED | `Close` | エラーを返し、何も変えない | 3.10.4 | `TestClose_AlreadyClosing_ReturnsError` | 省略（[design.md](../../docs/design.md)） |
 | SYN-RECEIVED、ESTABLISHED、FIN-WAIT-1、FIN-WAIT-2、CLOSE-WAIT | `Abort` | `<SEQ=SND.NXT><CTL=RST>` を送り、CLOSED にする。未送信のデータは送らない | 3.10.5 | `TestAbort_SendsRST`、`TestAbort_UnsentData_OnlyRST` | 済。実機では確かめていない |
 | CLOSING、LAST-ACK、TIME-WAIT | `Abort` | 何も送らずに CLOSED にする | 3.10.5 | `TestAbort_AfterBothFINs_NoRST` | 済 |
+| すべての接続 | `Stack.AbortAll` | 接続ごとに `Abort` をする。スタックを止めるとき（`tuntcp.Stack.Close`）に呼ぶ | 3.10.5、[design.md](../../docs/design.md) の「API とパッケージの形」 | `TestAbortAll_*` | 済 |
 | CLOSED | `Close`、`Abort` | "connection does not exist" を返す | 3.10.4、3.10.5 | `TestClose_AlreadyClosing_ReturnsError`、`TestAbort_Closed_ReturnsError` | 済 |
 
 ### タイマー（`Stack.HandleTimeouts`）
