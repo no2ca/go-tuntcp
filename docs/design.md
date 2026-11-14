@@ -140,6 +140,14 @@ flowchart LR
 
 RFC が決めていない、または RFC の推奨から意図して外れた振る舞い。
 
+- **API とパッケージの形**（2026-11-14、T8-1。AI が案を出し、人間が決めた）
+  - **置き場所と名前**: リポジトリの直下に `package tuntcp` を置く（import は `"go-tuntcp"`）。goroutine、チャネル、デバイスの読み書きは、この層だけが持つ。`internal/stack` は並行処理を持たない状態機械のまま残す。捨てた案: `internal/stack` にチャネルと API を足す（状態機械のテストに並行処理が混ざる）。`internal/` の下に置く（公開する API にならない）
+  - **型の名前**: `tuntcp.Stack`、`*tuntcp.Listener`、`*tuntcp.Conn`。アドレスは `*net.TCPAddr` で返す。標準の `net.ListenTCP` が `*net.TCPListener` を返すのと同じ形。捨てた案: `Listen` が `net.Listener` のインターフェースを返す（固有のメソッドを足すたびに型アサーションが要る）
+  - **起動**: `tuntcp.New(dev io.ReadWriteCloser) *Stack` がイベントループを始める。`dev` は、1 回の `Read` で IP パケットを 1 つ返し、1 回の `Write` で 1 つ受け取るもの（TUN デバイス。テストではメモリ上の偽物）。待ち受けは `(*Stack).Listen(port uint16) (*Listener, error)`。宛先の IP は見ない。`Listener.Addr()` は `0.0.0.0:port`、`Conn.LocalAddr()` は実際に届いた宛先を返す。捨てた案: `tuntcp.Open("tun0")` で TUN まで開く（テストに別の入口が要る）。`go s.Run(ctx)` を利用者に呼ばせる（呼び忘れると `Accept` が黙って止まる）
+  - **停止**: `(*Stack).Close()` は、すべての `Listener` を閉じ、残っている接続に RST を送って捨て（`Abort`）、ループを止め、デバイスを閉じる。ブロック中の `Accept` / `Read` / `Write` は `net.ErrClosed` で返る。捨てた案: 何も送らずに止める（相手は再送のタイムアウトまで気づかない）。FIN で閉じるのを待つ（再送のない間は、いつ終わるか決まらない）
+  - **時刻**: `internal/stack` の `Stack.Now` の注入は残す。`tuntcp` の層は `time` を直接使う
+  - パケットの表示は API に入れない。`cmd/tuntcp` が、デバイスを包んだ `io.ReadWriteCloser` を `New` に渡して表示する
+
 - **切断と時計**（2026-11-13、M7。人間が「終わるまで自走してよい」としたので AI が決めた。2026-11-14 に人間が承認した）
   - RFC の解釈が入ったもの
     - **TIME-WAIT で相手の FIN の再送を受けたら、First で 2MSL を数え直す。** RFC 9293 3.10.7.4 は Fifth と Eighth の TIME-WAIT に「相手の FIN の再送に ACK を返し、2MSL を数え直す」と書いているが、再送された FIN は SEG.SEQ が RCV.NXT の手前なので、First の検査（Table 6）で受理できずに終わり、Fifth にも Eighth にも届かない。文面の順番どおりに実装すると、数え直しが起きない。意図を、届く場所（First）で実装した。再送と見なすのは、FIN の番号（SEG.SEQ + データ長）が RCV.NXT-1 のものだけ。捨てた案: 文面どおり数え直さない（こちらの ACK がまた落ちると、TIME-WAIT が明けたあとの再送に RST を返すことになる）。TIME-WAIT で受理できないセグメントなら何でも数え直す（古い重複で TIME-WAIT が延び続ける）

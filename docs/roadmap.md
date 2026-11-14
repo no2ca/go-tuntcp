@@ -31,7 +31,7 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
 
 ## 現在の状態（2026-11-14）
 
-- M0〜7（実機確認の自動化、TUN、IPv4、TCP ヘッダ、handshake、データの送受信、切断）は完了。次は T8-1（API とパッケージの形を、人間が決める）
+- M0〜7（実機確認の自動化、TUN、IPv4、TCP ヘッダ、handshake、データの送受信、切断）は完了。M8 は T8-1（API とパッケージの形）を決めた。次は T8-2（イベントループ）
 - `curl` が仮のデモ（`cmd/tuntcp` の `demoServer`）から固定の HTTP レスポンスを受け取り、終了コード 0 で終わる。デモはレスポンスのあとに閉じ、`ss -tn` に接続が残らない
 - 再送はまだない（M9）。FIN や ACK が落ちると、切断が途中で止まる
 - `task test` はすべて通る
@@ -100,8 +100,9 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
 
 完了条件: `task e2e` で、`http.Serve` に渡した自作の `net.Listener` に `curl` が成功する。`go test -race ./...` が通る
 
-- [ ] **T8-1** API とパッケージの形を決める
+- [x] **T8-1** API とパッケージの形を決める
   - 公開するパッケージの名前と置き場所、型の名前、`Stack` の起動と停止の方法。案と理由を示して、人間が決める
+  - 決めた内容は [design.md](design.md) の「対話で決めた仕様」の「API とパッケージの形」にある
 - [ ] **T8-2** イベントループ
   - `Stack` を 1 つの goroutine が持ち、受信セグメント、タイマー、API の呼び出しをチャネルで受ける（[design.md](design.md) の「これから変えるところ」の 3）
 - [ ] **T8-3** `net.Listener`: `Accept` / `Close` / `Addr`
