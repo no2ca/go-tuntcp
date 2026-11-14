@@ -29,14 +29,14 @@ TUN デバイスの上に TCP プロトコルスタックを実装するまで�
 
 deadline を範囲に入れるのは、`net/http` が使うため。`http.Server` はブロック中の `Read` を中断するのに `SetReadDeadline` を過去の時刻で呼ぶ（Go の `net/http/server.go` の `abortPendingRead`）。何もしない実装では、接続の後始末で止まる。
 
-## 現在の状態（2026-11-13）
+## 現在の状態（2026-11-14）
 
 - M0〜7（実機確認の自動化、TUN、IPv4、TCP ヘッダ、handshake、データの送受信、切断）は完了。次は T8-1（API とパッケージの形を、人間が決める）
 - `curl` が仮のデモ（`cmd/tuntcp` の `demoServer`）から固定の HTTP レスポンスを受け取り、終了コード 0 で終わる。デモはレスポンスのあとに閉じ、`ss -tn` に接続が残らない
 - 再送はまだない（M9）。FIN や ACK が落ちると、切断が途中で止まる
 - `task test` はすべて通る
 - `task e2e` は sudo なしで動き、handshake、データへの ACK、レスポンスへの ACK、`curl` が受け取った本文と終了コード、両方の向きの切断、`ss -tn` に接続が残らないことを検証して終了コードで返す
-- M7 で AI が決めた仕様が、人間の確認待ち（[design.md](design.md) の「対話で決めた仕様」の「切断と時計」）。M7 の抜き取りと予想の確認も、人間の番
+- M6 と M7 で AI が決めた仕様（[design.md](design.md) の「対話で決めた仕様」の「切断と時計」と「仮の読み書き口」）は、2026-11-14 に人間が承認した。M7 の抜き取り（行は [verification-log.md](verification-log.md) に示してある）と予想の確認は、人間の番のまま
 
 ## 完了したマイルストーン
 
@@ -59,7 +59,7 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
   - 送信: `Connection.Write`（仮の口）で送信バッファに積み、SND.NXT から相手のウィンドウと MSS 536 に収まる分を切り出して送る。送るパケットは `Stack.TakeOutgoing` の送信キューから出す
   - ESTABLISHED での ACK（Fifth）: SND.UNA を進めて送信バッファから捨て、SND.WL1 / SND.WL2 の条件で送信ウィンドウを更新する
   - `task e2e` が、`curl` の受け取った本文と、レスポンスへの ACK を検証する
-  - AI が決めた仕様のうち、仮の読み書き口は [design.md](design.md) の「対話で決めた仕様」にあり、人間の確認待ち。送信キューの形は T7-0 で人間が決め直した
+  - AI が決めた仕様のうち、仮の読み書き口は [design.md](design.md) の「対話で決めた仕様」にあり、2026-11-14 に人間が承認した。送信キューの形は T7-0 で人間が決め直した
   - 後回しにしたもの: 受信バッファと送信バッファの上限、広告ウィンドウを空きから決めること（M10）、ACK を遅らせてデータに相乗りさせること（決めていない）
 
 - [x] **M7** 切断（T7-0〜T7-7）
@@ -83,7 +83,7 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
     - FIN を送る: ESTABLISHED → FIN-WAIT-1、CLOSE-WAIT → LAST-ACK
     - 自分の FIN への ACK を受けたときの遷移: FIN-WAIT-1 → FIN-WAIT-2、CLOSING → TIME-WAIT、LAST-ACK → CLOSED
     - FIN-WAIT-1 と FIN-WAIT-2 で受けるデータと FIN（T7-3 の残り）、各状態での RST もここで実装した
-    - AI が決めた仕様（FIN を別のセグメントで送る、FIN にもウィンドウの空きを求める、など）は [design.md](design.md) の「対話で決めた仕様」にあり、人間の確認待ち
+    - AI が決めた仕様（FIN を別のセグメントで送る、FIN にもウィンドウの空きを求める、など）は [design.md](design.md) の「対話で決めた仕様」にあり、2026-11-14 に人間が承認した
   - [x] **T7-5** TIME-WAIT の 2MSL タイマー
     - MSL は RFC 9293 3.4.2 の 2 分。TIME-WAIT に入ってから 4 分で接続を消す。相手の FIN の再送を受けたら数え直す
   - [x] **T7-6** 異常時に RST を送って接続を捨てる（Abort）
