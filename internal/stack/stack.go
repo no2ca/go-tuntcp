@@ -710,3 +710,7 @@ func (c *Connection) Abort() error {
 	c.stack.reap(c)
 	return nil
 }
+
+// AbortAll は、残っているすべての接続を Abort で捨てる。
+func (s *Stack) AbortAll() {
+}

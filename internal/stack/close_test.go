@@ -1279,3 +1279,32 @@ func TestAbort_Closed_ReturnsError(t *testing.T) {
 		t.Errorf("sent %d segments on a closed connection, want 0", len(segs))
 	}
 }
+
+func TestAbortAll_SendsRSTAndEmptiesTable(t *testing.T) {
+	// スタックを止めるとき (tuntcp.Stack.Close) に呼ぶ。残っている接続のそれぞれに 3.10.5 の Abort をする。
+	// ESTABLISHED の接続には <SEQ=SND.NXT><CTL=RST> を送り、テーブルから消す
+	s := newTestStack()
+	c := establish(t, s)
+
+	s.AbortAll()
+
+	segs := takeSent(t, s)
+	if len(segs) != 1 {
+		t.Fatalf("sent %d segments, want 1 (RST)", len(segs))
+	}
+	checkSegment(t, segs[0].hdr, tcp.FlagRST, testISS+1, 0)
+	checkState(t, c, tcp.StateClosed)
+	if len(s.conns) != 0 {
+		t.Errorf("%d connections left in the table, want 0", len(s.conns))
+	}
+}
+
+func TestAbortAll_NoConnections_SendsNothing(t *testing.T) {
+	s := newTestStack()
+
+	s.AbortAll()
+
+	if segs := takeSent(t, s); len(segs) != 0 {
+		t.Errorf("sent %d segments, want 0", len(segs))
+	}
+}
