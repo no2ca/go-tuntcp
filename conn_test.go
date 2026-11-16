@@ -582,6 +582,7 @@ func TestConn_ReadAndWriteDeadlines_AreIndependent(t *testing.T) {
 	if r := wait(t, writeAsync(c, []byte("w"))); r.n != 1 || r.err != nil {
 		t.Errorf("Write with an expired read deadline = (%d, %v), want (1, nil)", r.n, r.err)
 	}
+	p.drain(t, 1)
 	c.SetReadDeadline(time.Time{})
 
 	c.SetWriteDeadline(time.Unix(1, 0))

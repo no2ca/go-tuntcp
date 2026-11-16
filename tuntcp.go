@@ -6,9 +6,9 @@ package tuntcp
 
 import (
 	"bytes"
-	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"syscall"
 	"time"
@@ -41,8 +41,14 @@ type Stack struct {
 	quit  chan struct{} // Close が閉じる。ループに終わるよう伝える
 	done  chan struct{} // ループが終わったときに閉じる
 
-	// listeners は、待ち受けているポートと Listener の対応。ループの goroutine だけが触る
+	// 以下は、ループの goroutine だけが触る
+
+	// listeners は、待ち受けているポートと Listener の対応
 	listeners map[uint16]*Listener
+	// waiting は、Read か Write で待っている呼び出しのある接続。入力を 1 つ処理するたびに、進められるかを見る
+	waiting map[*Conn]struct{}
+	// stopping は、Close でループが終わりかけていること。待っている呼び出しを net.ErrClosed で返す
+	stopping bool
 
 	interval time.Duration // ループがタイマーの期限を調べる間隔
 
@@ -65,8 +71,8 @@ type Listener struct {
 }
 
 // Accept は、handshake の終わった接続を 1 つ返す。なければ、できるまで待つ。
-// Listener か Stack が閉じられると、待っている呼び出しも、そのあとの呼び出しも net.ErrClosed を返す
-// (エラーを包む形は T8-5 で決める)。
+// Listener か Stack が閉じられると、待っている呼び出しも、そのあとの呼び出しも net.ErrClosed を返す。
+// エラーは、標準の net と同じく *net.OpError で包む。
 //
 // 返す接続は、相手がすでに閉じていたり、RST で消えていたりすることがある。
 // その場合は、Read や Write がエラーを返す (T8-5)。
@@ -83,13 +89,18 @@ func (l *Listener) Accept() (net.Conn, error) {
 		l.waiters = append(l.waiters, ch)
 	})
 	if err != nil || closed {
-		return nil, net.ErrClosed
+		return nil, l.opError("accept", net.ErrClosed)
 	}
 	c, ok := <-ch
 	if !ok {
-		return nil, net.ErrClosed
+		return nil, l.opError("accept", net.ErrClosed)
 	}
-	return &Conn{s: l.s, c: c}, nil
+	return newConn(l.s, c), nil
+}
+
+// opError は、エラーを標準の net と同じ形に包む。
+func (l *Listener) opError(op string, err error) error {
+	return &net.OpError{Op: op, Net: "tcp", Addr: l.Addr(), Err: err}
 }
 
 // Close は、待ち受けをやめる。Accept されていない接続には RST を送って捨て、待っている Accept を
@@ -105,7 +116,7 @@ func (l *Listener) Close() error {
 		l.s.closeListener(l)
 	})
 	if err != nil || already {
-		return net.ErrClosed
+		return l.opError("close", net.ErrClosed)
 	}
 	return nil
 }
@@ -142,23 +153,6 @@ func (s *Stack) serveAccepts() {
 	}
 }
 
-// Conn は、Listener.Accept が返す接続。net.Conn を満たす。メソッドの中身は T8-4 から入れる。
-type Conn struct {
-	s *Stack
-	c *stack.Connection
-}
-
-var errNotImplemented = errors.New("tuntcp: not implemented")
-
-func (c *Conn) Read(p []byte) (int, error)         { return 0, errNotImplemented }
-func (c *Conn) Write(p []byte) (int, error)        { return 0, errNotImplemented }
-func (c *Conn) Close() error                       { return errNotImplemented }
-func (c *Conn) LocalAddr() net.Addr                { return nil }
-func (c *Conn) RemoteAddr() net.Addr               { return nil }
-func (c *Conn) SetDeadline(t time.Time) error      { return errNotImplemented }
-func (c *Conn) SetReadDeadline(t time.Time) error  { return errNotImplemented }
-func (c *Conn) SetWriteDeadline(t time.Time) error { return errNotImplemented }
-
 // New は、dev の上でスタックを動かし始める。goroutine を 2 つ起こす (デバイスを読むものと、ループ)。
 // 止めるには Close を呼ぶ。
 //
@@ -181,6 +175,7 @@ func newStack(dev io.ReadWriteCloser, now func() time.Time, interval time.Durati
 		calls:    make(chan func()),
 
 		listeners: make(map[uint16]*Listener),
+		waiting:   make(map[*Conn]struct{}),
 		quit:      make(chan struct{}),
 		done:      make(chan struct{}),
 	}
@@ -227,14 +222,17 @@ func (s *Stack) run() {
 		case fn := <-s.calls:
 			fn()
 		case <-s.quit:
+			s.stopping = true
 			for _, l := range s.listeners {
 				s.closeListener(l)
 			}
+			s.serveConns()
 			s.stk.AbortAll()
 			s.flush()
 			return
 		}
 		s.serveAccepts()
+		s.serveConns()
 		s.flush()
 	}
 }
@@ -280,8 +278,7 @@ func (s *Stack) call(fn func()) error {
 
 // Listen は、port で接続を待ち受ける。宛先の IP アドレスは見ない。
 // 返ったあとに届いた SYN から、受け付ける。
-// すでに待ち受けているポートなら syscall.EADDRINUSE を、Close のあとは net.ErrClosed を返す
-// (エラーを包む形は T8-5 で決める)。
+// すでに待ち受けているポートなら syscall.EADDRINUSE を、Close のあとは net.ErrClosed を、*net.OpError で包んで返す。
 func (s *Stack) Listen(port uint16) (*Listener, error) {
 	l := &Listener{s: s, port: port}
 	var listenErr error
@@ -291,11 +288,11 @@ func (s *Stack) Listen(port uint16) (*Listener, error) {
 		}
 	})
 	if err != nil {
-		return nil, err
+		return nil, l.opError("listen", err)
 	}
 	if listenErr != nil {
 		// stack.Listen が返すエラーは ErrPortInUse だけ
-		return nil, syscall.EADDRINUSE
+		return nil, l.opError("listen", os.NewSyscallError("bind", syscall.EADDRINUSE))
 	}
 	return l, nil
 }

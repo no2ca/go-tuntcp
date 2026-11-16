@@ -112,6 +112,16 @@ type Connection struct {
 	// Close を呼んでも、送信バッファのデータを送り切るまで FIN は送らないので、状態だけでは分からない
 	finSent bool
 
+	// finReceived は、相手の FIN を処理したかどうか。接続が CLOSED になったあとも残る。
+	// 利用者の Read が、読み切ったあとに io.EOF を返すのに使う (PeerClosed)
+	finReceived bool
+
+	// reset は、相手の RST で接続が消えたかどうか。利用者の Read と Write が ECONNRESET を返すのに使う (Reset)
+	reset bool
+
+	// released は、利用者が接続を手放したかどうか (Release)。手放したあとに新しいデータが届いたら、RST を送る
+	released bool
+
 	// timeWait は TIME-WAIT の 2MSL タイマー。TIME-WAIT に入るときに動かす
 	timeWait timer
 
@@ -215,15 +225,18 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 	// やっていないこと:
 	//   - RFC 5961 の challenge ACK (SEG.SEQ が RCV.NXT と一致しない RST には ACK を返すだけにする)。
 	//     意図して省いた。目標のあとで足す。いまはウィンドウ内の RST ならどれでも接続を閉じる
-	//   - 利用者への "connection reset" の通知と、再送キューの破棄 (未実装。通知する相手もキューもまだ無い。M8、M9)
+	//   - 再送キューの破棄 (未実装。キューがまだ無い。M9)
 	if t.HasFlag(tcp.FlagRST) {
 		switch c.State {
 		case tcp.StateSynReceived:
 			// passive open しか無いので、常に LISTEN に戻る
 			c.State = tcp.StateListen
 		default:
-			// 同期済みの状態 (ESTABLISHED から TIME-WAIT まで) は、どれも CLOSED にする
+			// 同期済みの状態 (ESTABLISHED から TIME-WAIT まで) は、どれも CLOSED にする。
+			// "any outstanding RECEIVEs and SEND should receive "reset" responses": reset を立てておき、
+			// tuntcp.Conn の Read と Write がそれを見て ECONNRESET を返す
 			c.State = tcp.StateClosed
+			c.reset = true
 		}
 		return nil
 	}
@@ -357,6 +370,14 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 	receiving := c.State == tcp.StateEstablished || c.State == tcp.StateFinWait1 || c.State == tcp.StateFinWait2
 	if receiving && len(payload) > 0 {
 		if t.Seq == c.Rcv.NXT {
+			// RFC 9293 3.6.1 SHLD-3: 利用者が接続を手放したあとに新しいデータが届いたら、RST を送って
+			// データが失われたことを相手に知らせる ("if new data is received after CLOSE is called")。
+			// 読む人がいないので、受け取っても捨てるしかない。
+			// RCV.NXT から始まらないデータは新しいデータとして受け取らないので、下の ACK だけを返す
+			if c.released {
+				c.State = tcp.StateClosed
+				return buildSegment(c.Key.Local, c.Key.Remote, tcp.FlagRST, c.Snd.NXT, 0, c.Rcv.WND, nil)
+			}
 			c.rcvBuf.Write(payload)
 			c.Rcv.NXT += uint32(len(payload))
 		}
@@ -377,11 +398,12 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 	// 仕様の文面どおり RCV.NXT を進めて ACK を返す (状態は "Remain")。相手の誤りでしか起きない。
 	// 再送された FIN は SEG.SEQ が RCV.NXT の手前なので、First で落ちてここには来ない。
 	//
-	// やっていないこと:
-	//   - 利用者への "connection closing" の通知 (未実装。Read が io.EOF を返すようにするのは T8-5)
+	// 利用者への "connection closing" の通知は、finReceived を立てておき、tuntcp.Conn の Read が
+	// 受信バッファを読み切ったあとに io.EOF を返すことで行う。
 	if t.HasFlag(tcp.FlagFIN) {
 		if t.Seq+uint32(len(payload)) == c.Rcv.NXT {
 			c.Rcv.NXT++
+			c.finReceived = true
 			switch c.State {
 			case tcp.StateEstablished:
 				// SYN-RECEIVED で受けた FIN もここに来る。Fifth を通った時点で ESTABLISHED になっている
@@ -629,14 +651,16 @@ func (c *Connection) Read(p []byte) int {
 // 仮の書き込み口。T6-7 のデモで main が呼ぶ。M8 で net.Conn の Write に置き換える。
 // エラーの形 (net.OpError で包むかなど) は T8-5 で決める。
 //
-// やっていないこと:
-//   - 送信バッファの上限と "insufficient resources" (未実装。M10)
+// 送信バッファの上限 (maxSendBuffer) までしか積まない。積めたバイト数を返す。0 のこともある。
+// 仕様は、積めないときに "error: insufficient resources" を返すとしているが、エラーにはせず、
+// 呼ぶ側 (tuntcp.Conn.Write) が ACK で空くのを待って、残りを書き直す。
 func (c *Connection) Write(p []byte) (int, error) {
 	switch c.State {
 	case tcp.StateSynReceived, tcp.StateEstablished, tcp.StateCloseWait:
-		c.sndBuf.Write(p)
+		n := min(len(p), maxSendBuffer-c.sndBuf.Len())
+		c.sndBuf.Write(p[:n])
 		c.output()
-		return len(p), nil
+		return n, nil
 	case tcp.StateFinWait1, tcp.StateFinWait2, tcp.StateClosing, tcp.StateLastAck, tcp.StateTimeWait:
 		// Close を呼んだあと。FIN より後ろにデータは送れない
 		return 0, errConnClosing
@@ -645,18 +669,52 @@ func (c *Connection) Write(p []byte) (int, error) {
 	}
 }
 
-// PeerClosed は、相手の FIN を受け取ったかどうかを返す。
+// maxSendBuffer は、送信バッファ (書かれたが ACK されていないデータ) の上限。
+// RFC にはない値で、docs/design.md の「対話で決めた仕様」の「net.Conn」で決めた。
+// 広告ウィンドウ (defaultWndSize) と同じ値にしただけで、ほかに根拠はない。
+const maxSendBuffer = 65535
+
+// PeerClosed は、相手の FIN を受け取ったかどうかを返す。接続が消えたあとも変わらない。
+// true なら、受信バッファにあるものが、相手から届くデータのすべて。
+// tuntcp.Conn の Read が、読み切ったあとに io.EOF を返すために見る。
 func (c *Connection) PeerClosed() bool {
-	return false
+	return c.finReceived
 }
 
-// Reset は、相手の RST で接続が消えたかどうかを返す。
+// Reset は、相手の RST で接続が消えたかどうかを返す。自分が RST を送って捨てたとき (Abort) は false。
+// tuntcp.Conn の Read と Write が、ECONNRESET を返すために見る。
 func (c *Connection) Reset() bool {
-	return false
+	return c.reset
 }
 
-// Release は、利用者が接続を手放すときに呼ぶ (net.Conn の Close)。
+// Release は、利用者が接続を手放すときに呼ぶ (net.Conn の Close)。読む向きも書く向きも、もう使わない。
+// RFC の CLOSE (Connection.Close) は送る向きだけを閉じ、そのあとも受け取れるので、別の口にしてある。
+// RFC 9293 3.6.1 MAY-1 の "half-duplex" な close に当たる。
+//
+// 読み残しがなければ、Close と同じく FIN を送って閉じる。
+// 読み残しがあれば、Abort で RST を送って捨てる (RFC 9293 3.6.1 SHLD-3: "If such a host issues a CLOSE call
+// while received data is still pending in the TCP connection ... its TCP implementation SHOULD send a RST
+// to show that data was lost")。手放したあとに届いた新しいデータに RST を返すのは、segmentArrives の Seventh。
+//
+// 呼ぶのは 1 回だけ (tuntcp.Conn.Close が守る)。接続がすでに消えていれば、何もしない。
+//
+// やっていないこと:
+//   - FIN-WAIT-2 で相手の FIN を待つ時間の上限 (意図して省いた。RFC にはなく、値の根拠がない。
+//     相手が FIN を送らなければ、接続は残り続ける)
 func (c *Connection) Release() {
+	switch c.State {
+	case tcp.StateEstablished, tcp.StateCloseWait:
+	default:
+		// 相手の RST などで、すでに消えている。Accept が返すのは ESTABLISHED 以降の接続で、
+		// 自分から閉じるのはこの呼び出しだけなので、ほかの状態では呼ばれない
+		return
+	}
+	if c.rcvBuf.Len() > 0 {
+		_ = c.Abort()
+		return
+	}
+	c.released = true
+	_ = c.Close()
 }
 
 // 利用者の呼び出しに返すエラー。文言は RFC 9293 3.10 の "error: ..." に合わせてある。
