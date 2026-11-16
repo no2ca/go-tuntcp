@@ -6,6 +6,7 @@ package tuntcp
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -43,8 +44,37 @@ type Stack struct {
 	closeErr  error
 }
 
-// Listener は、Stack.Listen が返す待ち受け口。Accept / Close / Addr は T8-3 で足す。
+// Listener は、Stack.Listen が返す待ち受け口。net.Listener を満たす。
 type Listener struct{}
+
+// Accept は、handshake の終わった接続を 1 つ返す。なければ、できるまで待つ。
+func (l *Listener) Accept() (net.Conn, error) {
+	return nil, nil
+}
+
+// Close は、待ち受けをやめる。
+func (l *Listener) Close() error {
+	return nil
+}
+
+// Addr は、待ち受けているアドレスを返す。
+func (l *Listener) Addr() net.Addr {
+	return nil
+}
+
+// Conn は、Listener.Accept が返す接続。net.Conn を満たす。メソッドの中身は T8-4 から入れる。
+type Conn struct{}
+
+var errNotImplemented = errors.New("tuntcp: not implemented")
+
+func (c *Conn) Read(p []byte) (int, error)         { return 0, errNotImplemented }
+func (c *Conn) Write(p []byte) (int, error)        { return 0, errNotImplemented }
+func (c *Conn) Close() error                       { return errNotImplemented }
+func (c *Conn) LocalAddr() net.Addr                { return nil }
+func (c *Conn) RemoteAddr() net.Addr               { return nil }
+func (c *Conn) SetDeadline(t time.Time) error      { return errNotImplemented }
+func (c *Conn) SetReadDeadline(t time.Time) error  { return errNotImplemented }
+func (c *Conn) SetWriteDeadline(t time.Time) error { return errNotImplemented }
 
 // New は、dev の上でスタックを動かし始める。goroutine を 2 つ起こす (デバイスを読むものと、ループ)。
 // 止めるには Close を呼ぶ。

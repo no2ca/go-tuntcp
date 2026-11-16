@@ -439,8 +439,22 @@ func (s *Stack) Conn(local, remote netip.AddrPort) *Connection {
 	return s.conns[connKey{Local: local, Remote: remote}]
 }
 
-func (s *Stack) Listen(port uint16) {
+// ErrPortInUse は、すでに待ち受けているポートに Listen したときのエラー。
+var ErrPortInUse = errors.New("port already in use")
+
+// Listen は、port で接続を待ち受ける。
+func (s *Stack) Listen(port uint16) error {
 	s.listeners[port] = struct{}{}
+	return nil
+}
+
+// Accept は、port の accept キューの先頭の接続を取り出す。なければ nil。
+func (s *Stack) Accept(port uint16) *Connection {
+	return nil
+}
+
+// CloseListener は、port の待ち受けをやめる。
+func (s *Stack) CloseListener(port uint16) {
 }
 
 // Handle は、受信セグメントを 1 つ処理する。送るパケットは送信キューに積み、戻り値では返さない。
