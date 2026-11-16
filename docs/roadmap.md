@@ -31,7 +31,7 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
 
 ## 現在の状態（2026-11-14）
 
-- M0〜7（実機確認の自動化、TUN、IPv4、TCP ヘッダ、handshake、データの送受信、切断）は完了。M8 は T8-1（API とパッケージの形）を決めた。T8-2（イベントループ）まで済んだ。次は T8-3（`net.Listener`）
+- M0〜7（実機確認の自動化、TUN、IPv4、TCP ヘッダ、handshake、データの送受信、切断）は完了。M8 は T8-1（API とパッケージの形）を決めた。T8-3（`net.Listener`）まで済んだ。次は T8-4（`net.Conn`）
 - `curl` が仮のデモ（`cmd/tuntcp` の `demoServer`）から固定の HTTP レスポンスを受け取り、終了コード 0 で終わる。デモはレスポンスのあとに閉じ、`ss -tn` に接続が残らない
 - 再送はまだない（M9）。FIN や ACK が落ちると、切断が途中で止まる
 - 公開パッケージ `tuntcp`（リポジトリの直下）にイベントループがある。`cmd/tuntcp` はまだ自前のループと仮のデモで動いていて、`tuntcp` を使うのは T8-8 から
@@ -109,9 +109,11 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
   - `tuntcp.New` / `Listen` / `Close` と、止めるときにすべての接続を捨てる `stack.Stack.AbortAll` を入れた。`Listen` が返す `Listener` は、まだメソッドを持たない
   - ループがタイマーを処理する行は、テストが通っていない。`Conn.Close` で TIME-WAIT に入れるようになる T8-4 で確かめる
   - `tun.Create` が返す `*os.File` は、`Close` しても待っている `Read` が返らないかもしれない（`Fd()` を呼ぶとブロッキングに戻るため）。T8-8 で `cmd/tuntcp` を載せ替えるときに確かめる
-- [ ] **T8-3** `net.Listener`: `Accept` / `Close` / `Addr`
+- [x] **T8-3** `net.Listener`: `Accept` / `Close` / `Addr`
   - ESTABLISHED になった接続を accept キューに積む。キューの上限と、溢れたときの扱いを決める
   - `Close` したら、ブロック中の `Accept` は `net.ErrClosed` で返る
+  - 決めた内容は [design.md](design.md) の「対話で決めた仕様」の「accept キュー」にある。AI が足した 3 点は、人間の確認待ち
+  - `Accept` が返す `Conn` は、まだ型だけ（メソッドは `errNotImplemented` を返す）
 - [ ] **T8-4** `net.Conn`: `Read` / `Write` / `Close` / `LocalAddr` / `RemoteAddr`
   - `Read` はデータが来るまでブロックする。`Write` は送信バッファに空きができるまでブロックする
   - `Close` は送信バッファの残りを送ってから FIN を送る。呼び出し自体は待たずに返る

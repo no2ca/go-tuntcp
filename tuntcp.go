@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 
 	"go-tuntcp/internal/ipv4"
@@ -40,30 +41,110 @@ type Stack struct {
 	quit  chan struct{} // Close が閉じる。ループに終わるよう伝える
 	done  chan struct{} // ループが終わったときに閉じる
 
+	// listeners は、待ち受けているポートと Listener の対応。ループの goroutine だけが触る
+	listeners map[uint16]*Listener
+
 	closeOnce sync.Once
 	closeErr  error
 }
 
 // Listener は、Stack.Listen が返す待ち受け口。net.Listener を満たす。
-type Listener struct{}
+// メソッドは、どの goroutine から呼んでもよい。
+type Listener struct {
+	s    *Stack
+	port uint16
+
+	// 以下は、ループの goroutine だけが触る
+
+	// waiters は、Accept で待っている呼び出し。呼ばれた順に並ぶ。
+	// 接続を渡すときは送り、Listener が閉じたときはチャネルを閉じる
+	waiters []chan *stack.Connection
+	closed  bool
+}
 
 // Accept は、handshake の終わった接続を 1 つ返す。なければ、できるまで待つ。
+// Listener か Stack が閉じられると、待っている呼び出しも、そのあとの呼び出しも net.ErrClosed を返す
+// (エラーを包む形は T8-5 で決める)。
+//
+// 返す接続は、相手がすでに閉じていたり、RST で消えていたりすることがある。
+// その場合は、Read や Write がエラーを返す (T8-5)。
 func (l *Listener) Accept() (net.Conn, error) {
-	return nil, nil
+	// バッファを 1 つ持たせ、ループが渡すときに待たないようにする
+	ch := make(chan *stack.Connection, 1)
+	closed := false
+	err := l.s.call(func() {
+		if l.closed {
+			closed = true
+			return
+		}
+		// 接続がすでにキューにあれば、この関数のすぐあとの serveAccepts が渡す
+		l.waiters = append(l.waiters, ch)
+	})
+	if err != nil || closed {
+		return nil, net.ErrClosed
+	}
+	c, ok := <-ch
+	if !ok {
+		return nil, net.ErrClosed
+	}
+	return &Conn{s: l.s, c: c}, nil
 }
 
-// Close は、待ち受けをやめる。
+// Close は、待ち受けをやめる。Accept されていない接続には RST を送って捨て、待っている Accept を
+// net.ErrClosed で返す。Accept 済みの接続はそのまま使える。
+// 2 回目からと、Stack を止めたあとは、標準の net.Listener と同じく net.ErrClosed を返す。
 func (l *Listener) Close() error {
+	already := false
+	err := l.s.call(func() {
+		if l.closed {
+			already = true
+			return
+		}
+		l.s.closeListener(l)
+	})
+	if err != nil || already {
+		return net.ErrClosed
+	}
 	return nil
 }
 
-// Addr は、待ち受けているアドレスを返す。
+// Addr は、待ち受けているアドレスを *net.TCPAddr で返す。宛先の IP アドレスは見ないので、IP は 0.0.0.0。
 func (l *Listener) Addr() net.Addr {
-	return nil
+	return &net.TCPAddr{IP: net.IPv4zero, Port: int(l.port)}
+}
+
+// closeListener は、Listener を閉じる。ループの goroutine の上で呼ぶ。
+func (s *Stack) closeListener(l *Listener) {
+	l.closed = true
+	delete(s.listeners, l.port)
+	s.stk.CloseListener(l.port)
+	for _, ch := range l.waiters {
+		close(ch)
+	}
+	l.waiters = nil
+}
+
+// serveAccepts は、accept キューに接続があれば、Accept で待っている呼び出しに、待ち始めた順に渡す。
+// ループが入力を 1 つ処理するたびに呼ぶ。キューが変わるのは受信のあと、待つ側が増えるのは
+// API の呼び出しのあとで、どちらもループの入力に当たる。
+func (s *Stack) serveAccepts() {
+	for _, l := range s.listeners {
+		for len(l.waiters) > 0 {
+			c := s.stk.Accept(l.port)
+			if c == nil {
+				break
+			}
+			l.waiters[0] <- c
+			l.waiters = l.waiters[1:]
+		}
+	}
 }
 
 // Conn は、Listener.Accept が返す接続。net.Conn を満たす。メソッドの中身は T8-4 から入れる。
-type Conn struct{}
+type Conn struct {
+	s *Stack
+	c *stack.Connection
+}
 
 var errNotImplemented = errors.New("tuntcp: not implemented")
 
@@ -88,8 +169,10 @@ func New(dev io.ReadWriteCloser) *Stack {
 		stk:   stack.New(),
 		rx:    make(chan []byte),
 		calls: make(chan func()),
-		quit:  make(chan struct{}),
-		done:  make(chan struct{}),
+
+		listeners: make(map[uint16]*Listener),
+		quit:      make(chan struct{}),
+		done:      make(chan struct{}),
 	}
 	go s.readLoop()
 	go s.run()
@@ -134,10 +217,14 @@ func (s *Stack) run() {
 		case fn := <-s.calls:
 			fn()
 		case <-s.quit:
+			for _, l := range s.listeners {
+				s.closeListener(l)
+			}
 			s.stk.AbortAll()
 			s.flush()
 			return
 		}
+		s.serveAccepts()
 		s.flush()
 	}
 }
@@ -183,12 +270,24 @@ func (s *Stack) call(fn func()) error {
 
 // Listen は、port で接続を待ち受ける。宛先の IP アドレスは見ない。
 // 返ったあとに届いた SYN から、受け付ける。
-// Close のあとは net.ErrClosed を返す (エラーを包む形は T8-5 で決める)。
+// すでに待ち受けているポートなら syscall.EADDRINUSE を、Close のあとは net.ErrClosed を返す
+// (エラーを包む形は T8-5 で決める)。
 func (s *Stack) Listen(port uint16) (*Listener, error) {
-	if err := s.call(func() { s.stk.Listen(port) }); err != nil {
+	l := &Listener{s: s, port: port}
+	var listenErr error
+	err := s.call(func() {
+		if listenErr = s.stk.Listen(port); listenErr == nil {
+			s.listeners[port] = l
+		}
+	})
+	if err != nil {
 		return nil, err
 	}
-	return &Listener{}, nil
+	if listenErr != nil {
+		// stack.Listen が返すエラーは ErrPortInUse だけ
+		return nil, syscall.EADDRINUSE
+	}
+	return l, nil
 }
 
 // Close は、スタックを止める。残っている接続に RST を送って捨て、ループを止め、デバイスを閉じる。

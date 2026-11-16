@@ -161,7 +161,18 @@ func handshake(t *testing.T, dev *fakeDev, port uint16) uint32 {
 		t.Fatalf("setup: reply to SYN = %s to port %d, want SYN | ACK to port %d", th.StringFlags(), th.DstPort, port)
 	}
 	dev.inject(t, segmentFrom(port, tcp.FlagACK, clientISN+1, th.Seq+1, nil))
+	dev.sync(t)
 	return th.Seq
+}
+
+// sync は、これまでに inject したパケットがループに渡ったあとで返る。
+// inject は、読み取りの goroutine がパケットを読んだところで返るので、そのままだと、続けて呼ぶ API が
+// パケットの処理を追い越すことがある。読めないパケットをもう 1 つ入れると、それが読まれた時点で、
+// 前のパケットはループに渡っている (渡すチャネルにバッファがない)。ループは渡された入力を処理し終えてから
+// 次の入力を選ぶので、このあとの API の呼び出しは、前のパケットより後になる。
+func (d *fakeDev) sync(t *testing.T) {
+	t.Helper()
+	d.inject(t, []byte{0})
 }
 
 // noSent は、スタックがしばらく何も書かないことを確かめる。

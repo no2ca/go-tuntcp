@@ -409,7 +409,7 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 }
 
 type Stack struct {
-	listeners map[uint16]struct{}     // LISTEN中のポート
+	listeners map[uint16]*listener    // LISTEN中のポート
 	conns     map[connKey]*Connection // 確立中の接続（SYN-RECEIVED以降）
 	ISS       func() uint32           // 初期シーケンス番号の生成
 	out       [][]byte                // 送信キュー。送るパケットはすべてここを通る。TakeOutgoing で取り出す
@@ -418,7 +418,7 @@ type Stack struct {
 
 func New() *Stack {
 	return &Stack{
-		listeners: make(map[uint16]struct{}),
+		listeners: make(map[uint16]*listener),
 		conns:     make(map[connKey]*Connection),
 		ISS:       randomISS,
 		Now:       time.Now,
@@ -442,19 +442,79 @@ func (s *Stack) Conn(local, remote netip.AddrPort) *Connection {
 // ErrPortInUse は、すでに待ち受けているポートに Listen したときのエラー。
 var ErrPortInUse = errors.New("port already in use")
 
-// Listen は、port で接続を待ち受ける。
+// maxAcceptQueue は、accept キューに入る接続の上限。
+// RFC にはない値で、docs/design.md の「対話で決めた仕様」の「accept キュー」で決めた。
+const maxAcceptQueue = 128
+
+// listener は、待ち受けているポート 1 つ。
+type listener struct {
+	// queue は accept キュー。handshake が終わり、利用者がまだ Accept で取り出していない接続が、
+	// ESTABLISHED になった順に入っている。入ったあとで CLOSED になった接続 (相手の RST など) も、取り出されるまで残る
+	queue []*Connection
+}
+
+// Listen は、port で接続を待ち受ける (RFC 9293 3.10.1 の passive OPEN。相手は指定しない)。
+// すでに待ち受けているポートなら ErrPortInUse を返す。2 つの待ち受けが同じキューを分け合うと、
+// どちらを閉じたときに止まるのかが決まらないため。
 func (s *Stack) Listen(port uint16) error {
-	s.listeners[port] = struct{}{}
+	if _, ok := s.listeners[port]; ok {
+		return ErrPortInUse
+	}
+	s.listeners[port] = &listener{}
 	return nil
 }
 
-// Accept は、port の accept キューの先頭の接続を取り出す。なければ nil。
+// Accept は、port の accept キューの先頭の接続を取り出す。なければ nil。待たない。
+// 待つのは呼ぶ側 (tuntcp.Listener.Accept) の役目で、入力を 1 つ処理するたびにこれを呼び直す。
 func (s *Stack) Accept(port uint16) *Connection {
-	return nil
+	l := s.listeners[port]
+	if l == nil || len(l.queue) == 0 {
+		return nil
+	}
+	c := l.queue[0]
+	l.queue = l.queue[1:]
+	return c
 }
 
-// CloseListener は、port の待ち受けをやめる。
+// enqueue は、handshake の終わった接続を accept キューに入れる。SYN-RECEIVED の接続に届いた
+// セグメントを処理したあとに、Stack.Handle が呼ぶ。SYN-RECEIVED のままか、LISTEN や CLOSED に
+// 戻った接続には何もしない。
+//
+// キューが満杯なら、Abort で RST を送って捨てる。
+// 捨てた案: 満杯の間は SYN を無視する。相手の SYN の再送に頼ることになり、待ち時間が相手の RTO 次第になる。
+func (s *Stack) enqueue(c *Connection) {
+	switch c.State {
+	case tcp.StateSynReceived, tcp.StateListen, tcp.StateClosed:
+		return
+	}
+	// CloseListener が SYN-RECEIVED の接続を捨てるので、ここに来る接続のポートは待ち受け中
+	l := s.listeners[c.Key.Local.Port()]
+	if len(l.queue) >= maxAcceptQueue {
+		_ = c.Abort()
+		return
+	}
+	l.queue = append(l.queue, c)
+}
+
+// CloseListener は、port の待ち受けをやめる。以後の SYN には、閉じたポートとして RST を返す (RFC 9293 3.10.7.1)。
+// まだ Accept されていない接続 (accept キューの中のものと、SYN-RECEIVED のもの) は Abort で捨てる。
+// 残しておくと、誰も読まず、閉じもしない接続になる。Accept 済みの接続には触らない。
+// 接続が複数あるとき、RST を積む順番は決まっていない。
 func (s *Stack) CloseListener(port uint16) {
+	l := s.listeners[port]
+	if l == nil {
+		return
+	}
+	delete(s.listeners, port)
+	for _, c := range l.queue {
+		// キューの中で CLOSED になった接続は "connection does not exist" を返す。捨てるものがないだけ
+		_ = c.Abort()
+	}
+	for _, c := range s.conns {
+		if c.Key.Local.Port() == port && c.State == tcp.StateSynReceived {
+			_ = c.Abort()
+		}
+	}
 }
 
 // Handle は、受信セグメントを 1 つ処理する。送るパケットは送信キューに積み、戻り値では返さない。
@@ -471,7 +531,11 @@ func (s *Stack) Handle(ip ipv4.Header, t tcp.Header, payload []byte) {
 
 	// 既存の接続
 	if c, ok := s.conns[key]; ok {
+		synReceived := c.State == tcp.StateSynReceived
 		c.Handle(t, payload)
+		if synReceived {
+			s.enqueue(c)
+		}
 		s.reap(c)
 		return
 	}

@@ -37,7 +37,9 @@ func main() {
 	go readLoop(ctx, ch, dev)
 
 	stk := stack.New()
-	stk.Listen(80)
+	if err := stk.Listen(80); err != nil {
+		log.Fatal(err)
+	}
 	demo := newDemoServer()
 
 	// タイマーの期限は、Stack.HandleTimeouts を呼んだときに調べられる。いまあるタイマーは
@@ -78,6 +80,10 @@ func main() {
 			displayTCP(t)
 
 			stk.Handle(ip, t, tcpPayload)
+			// 仮のデモは接続を Stack.Conn で引くので、accept キューは使わない。
+			// 貯めたままにすると 128 本で満杯になり、新しい接続が RST で捨てられるので、取り出して空にしておく
+			for stk.Accept(80) != nil {
+			}
 			local := netip.AddrPortFrom(ip.Dst, t.DstPort)
 			remote := netip.AddrPortFrom(ip.Src, t.SrcPort)
 			if c := stk.Conn(local, remote); c != nil {
