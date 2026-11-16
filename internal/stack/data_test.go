@@ -188,7 +188,7 @@ func TestWrite_Established_SendsSegment(t *testing.T) {
 	s := newTestStack()
 	c := establish(t, s)
 
-	if err := c.Write([]byte("hello")); err != nil {
+	if _, err := c.Write([]byte("hello")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 	segs := takeSent(t, s)
@@ -227,7 +227,7 @@ func TestWrite_SegmentsByMSS(t *testing.T) {
 			s := newTestStack()
 			c := establish(t, s)
 			data := repeat(tt.n)
-			if err := c.Write(data); err != nil {
+			if _, err := c.Write(data); err != nil {
 				t.Fatalf("Write: %v", err)
 			}
 			segs := takeSent(t, s)
@@ -275,7 +275,7 @@ func TestWrite_LimitedBySendWindow(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s := newTestStack()
 			c := establishWithWindow(t, s, tt.wnd)
-			if err := c.Write(repeat(tt.n)); err != nil {
+			if _, err := c.Write(repeat(tt.n)); err != nil {
 				t.Fatalf("Write: %v", err)
 			}
 			segs := takeSent(t, s)
@@ -324,7 +324,7 @@ func TestWrite_SynReceived_QueuedUntilEstablished(t *testing.T) {
 	// handshake の ACK で ESTABLISHED になったら、続けて送る
 	s := newTestStack()
 	c := sendSYN(t, s)
-	if err := c.Write([]byte("early")); err != nil {
+	if _, err := c.Write([]byte("early")); err != nil {
 		t.Fatalf("Write in SYN-RECEIVED: %v", err)
 	}
 	if segs := takeSent(t, s); len(segs) != 0 {
@@ -371,7 +371,7 @@ func TestWrite_Closed_ReturnsError(t *testing.T) {
 	s.Handle(incomingIP(), incomingTCP(tcp.FlagRST, clientISN+1, 0), nil)
 	checkState(t, c, tcp.StateClosed)
 
-	if err := c.Write([]byte("hello")); err == nil {
+	if _, err := c.Write([]byte("hello")); err == nil {
 		t.Error("Write on a closed connection: err = nil, want an error")
 	}
 	if segs := takeSent(t, s); len(segs) != 0 {

@@ -44,6 +44,8 @@ type Stack struct {
 	// listeners は、待ち受けているポートと Listener の対応。ループの goroutine だけが触る
 	listeners map[uint16]*Listener
 
+	interval time.Duration // ループがタイマーの期限を調べる間隔
+
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -164,11 +166,19 @@ func (c *Conn) SetWriteDeadline(t time.Time) error { return errNotImplemented }
 // Close を呼ぶと、待っている Read が返るものであること。返らないデバイスでは、
 // 読み取りの goroutine が次のパケットが届くまで残る。
 func New(dev io.ReadWriteCloser) *Stack {
+	return newStack(dev, time.Now, timeoutInterval)
+}
+
+// newStack は New の中身。テストが、時計と、タイマーを調べる間隔を差し替えるために分けてある。
+func newStack(dev io.ReadWriteCloser, now func() time.Time, interval time.Duration) *Stack {
+	stk := stack.New()
+	stk.Now = now
 	s := &Stack{
-		dev:   dev,
-		stk:   stack.New(),
-		rx:    make(chan []byte),
-		calls: make(chan func()),
+		dev:      dev,
+		stk:      stk,
+		interval: interval,
+		rx:       make(chan []byte),
+		calls:    make(chan func()),
 
 		listeners: make(map[uint16]*Listener),
 		quit:      make(chan struct{}),
@@ -206,7 +216,7 @@ func (s *Stack) readLoop() {
 // 入力を 1 本に並べれば、ロックなしで動かせる。
 func (s *Stack) run() {
 	defer close(s.done)
-	tick := time.NewTicker(timeoutInterval)
+	tick := time.NewTicker(s.interval)
 	defer tick.Stop()
 	for {
 		select {

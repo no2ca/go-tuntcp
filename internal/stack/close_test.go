@@ -300,7 +300,7 @@ func TestWrite_CloseWait_SendsData(t *testing.T) {
 	s := newTestStack()
 	c := toCloseWait(t, s)
 
-	if err := c.Write([]byte("hello")); err != nil {
+	if _, err := c.Write([]byte("hello")); err != nil {
 		t.Fatalf("Write in CLOSE-WAIT: %v", err)
 	}
 
@@ -324,7 +324,7 @@ func TestHandle_CloseWait_ACK_SendsRemainingData(t *testing.T) {
 	s.Handle(incomingIP(), fin, nil)
 	takeSent(t, s) // FIN への ACK
 	mustState(t, c, tcp.StateCloseWait)
-	if err := c.Write([]byte("hello world")); err != nil {
+	if _, err := c.Write([]byte("hello world")); err != nil {
 		t.Fatalf("Write in CLOSE-WAIT: %v", err)
 	}
 	if segs := takeSent(t, s); len(segs) != 1 || string(segs[0].payload) != "hello" {
@@ -607,7 +607,7 @@ func TestWrite_AfterClose_ReturnsError(t *testing.T) {
 			s := newTestStack()
 			c := tt.setup(t, s)
 
-			if err := c.Write([]byte("hello")); !errors.Is(err, errConnClosing) {
+			if _, err := c.Write([]byte("hello")); !errors.Is(err, errConnClosing) {
 				t.Errorf("Write: err = %v, want %v", err, errConnClosing)
 			}
 			if segs := takeSent(t, s); len(segs) != 0 {
@@ -1269,7 +1269,7 @@ func TestAbort_Closed_ReturnsError(t *testing.T) {
 	if err := c.Abort(); !errors.Is(err, errConnNotExist) {
 		t.Errorf("second Abort: err = %v, want %v", err, errConnNotExist)
 	}
-	if err := c.Write([]byte("hello")); !errors.Is(err, errConnNotExist) {
+	if _, err := c.Write([]byte("hello")); !errors.Is(err, errConnNotExist) {
 		t.Errorf("Write after Abort: err = %v, want %v", err, errConnNotExist)
 	}
 	if err := c.Close(); !errors.Is(err, errConnNotExist) {

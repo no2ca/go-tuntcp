@@ -631,18 +631,32 @@ func (c *Connection) Read(p []byte) int {
 //
 // やっていないこと:
 //   - 送信バッファの上限と "insufficient resources" (未実装。M10)
-func (c *Connection) Write(p []byte) error {
+func (c *Connection) Write(p []byte) (int, error) {
 	switch c.State {
 	case tcp.StateSynReceived, tcp.StateEstablished, tcp.StateCloseWait:
 		c.sndBuf.Write(p)
 		c.output()
-		return nil
+		return len(p), nil
 	case tcp.StateFinWait1, tcp.StateFinWait2, tcp.StateClosing, tcp.StateLastAck, tcp.StateTimeWait:
 		// Close を呼んだあと。FIN より後ろにデータは送れない
-		return errConnClosing
+		return 0, errConnClosing
 	default:
-		return errConnNotExist
+		return 0, errConnNotExist
 	}
+}
+
+// PeerClosed は、相手の FIN を受け取ったかどうかを返す。
+func (c *Connection) PeerClosed() bool {
+	return false
+}
+
+// Reset は、相手の RST で接続が消えたかどうかを返す。
+func (c *Connection) Reset() bool {
+	return false
+}
+
+// Release は、利用者が接続を手放すときに呼ぶ (net.Conn の Close)。
+func (c *Connection) Release() {
 }
 
 // 利用者の呼び出しに返すエラー。文言は RFC 9293 3.10 の "error: ..." に合わせてある。

@@ -141,7 +141,7 @@ func (d *demoServer) serve(c *stack.Connection) {
 	}
 	delete(d.pending, c)
 	if complete {
-		if err := c.Write(demoResponse); err != nil {
+		if _, err := c.Write(demoResponse); err != nil {
 			log.Printf("demo: write: %v", err)
 		}
 	}

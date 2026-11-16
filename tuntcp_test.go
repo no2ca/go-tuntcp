@@ -43,7 +43,7 @@ type fakeDev struct {
 func newFakeDev() *fakeDev {
 	return &fakeDev{
 		in:     make(chan []byte),
-		out:    make(chan []byte, 16),
+		out:    make(chan []byte, 1024), // テストが読まなくても、ループが Write で止まらない大きさ
 		closed: make(chan struct{}),
 	}
 }
@@ -99,6 +99,13 @@ func (d *fakeDev) inject(t *testing.T, pkt []byte) {
 // Parse がチェックサムを確かめる。1 秒待っても書かれなければ、テストを止める。
 func (d *fakeDev) sent(t *testing.T) tcp.Header {
 	t.Helper()
+	th, _ := d.sentData(t)
+	return th
+}
+
+// sentData は、sent と同じことをして、データも返す。
+func (d *fakeDev) sentData(t *testing.T) (tcp.Header, []byte) {
+	t.Helper()
 	select {
 	case pkt := <-d.out:
 		ip, ipPayload, err := ipv4.Parse(pkt)
@@ -108,14 +115,14 @@ func (d *fakeDev) sent(t *testing.T) tcp.Header {
 		if ip.Src != ourAddr || ip.Dst != peerAddr {
 			t.Fatalf("IP %v > %v, want %v > %v", ip.Src, ip.Dst, ourAddr, peerAddr)
 		}
-		th, _, _, err := tcp.Parse(ip.Src.As4(), ip.Dst.As4(), ipPayload)
+		th, _, payload, err := tcp.Parse(ip.Src.As4(), ip.Dst.As4(), ipPayload)
 		if err != nil {
 			t.Fatalf("tcp.Parse: %v", err)
 		}
-		return th
+		return th, payload
 	case <-time.After(time.Second):
 		t.Fatal("the stack wrote no packet to the device within 1s")
-		return tcp.Header{}
+		return tcp.Header{}, nil
 	}
 }
 
