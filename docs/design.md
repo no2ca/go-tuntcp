@@ -148,7 +148,7 @@ flowchart LR
 
 RFC が決めていない、または RFC の推奨から意図して外れた振る舞い。
 
-- **accept キュー**（2026-11-14、T8-3。AI が案を出し、人間が決めた）
+- **accept キュー**（2026-11-16、T8-3。AI が案を出し、人間が決めた）
   - **上限**: `Listener` ごとに 128 本（`stack.maxAcceptQueue`）。入るのは handshake の終わった接続で、ESTABLISHED になった順に並ぶ。捨てた案: 上限なし（`Accept` を呼ばないサーバにつなぎ続けると、メモリが増え続ける）
   - **溢れたとき**: ESTABLISHED になった時点でキューが満杯なら、その接続を `Abort`（RST）で捨てる。捨てた案: 満杯の間は SYN を無視する（相手の SYN の再送に頼り、待ち時間が相手の RTO 次第になる）
   - **`Listener.Close`**: 待ち受けをやめる（以後の SYN には RST）。そのポートの、まだ `Accept` されていない接続（SYN-RECEIVED のものとキューの中のもの）は `Abort` する。`Accept` 済みの接続はそのまま。ブロック中と以後の `Accept` は `net.ErrClosed`。捨てた案: `Accept` されていない接続を残す（誰も読まず、閉じもしない接続になる）
