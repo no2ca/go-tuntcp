@@ -453,14 +453,6 @@ func randomISS() uint32 {
 	return binary.BigEndian.Uint32(b[:])
 }
 
-// Conn は、自分と相手のアドレスとポートの組で接続を引く。なければ nil。
-//
-// 仮の口。T6-7 のデモで、main が受信セグメントの宛先と送信元から接続を引き、
-// Connection.Read と Write を呼ぶために使う。M8 で net.Listener の Accept に置き換える。
-func (s *Stack) Conn(local, remote netip.AddrPort) *Connection {
-	return s.conns[connKey{Local: local, Remote: remote}]
-}
-
 // ErrPortInUse は、すでに待ち受けているポートに Listen したときのエラー。
 var ErrPortInUse = errors.New("port already in use")
 
@@ -578,7 +570,7 @@ func (s *Stack) reap(c *Connection) {
 
 // HandleTimeouts は、期限の来たタイマーを処理する。RFC 9293 3.10.8 (Timeouts)。
 // 呼ばれた時点の Now と期限を比べるので、呼ぶ間隔がタイマーの粒度になる。
-// main が一定の間隔で呼び、続けて TakeOutgoing で取り出して TUN に書く
+// tuntcp のループが一定の間隔で呼び、続けて TakeOutgoing で取り出してデバイスに書く
 // (いまあるタイマーは何も送らないが、M9 の再送タイマーは送る)。
 //
 // 時刻を Handle や HandleTimeouts の引数で渡さず、Now で引くのは、Close や Write のような
@@ -634,10 +626,10 @@ func (s *Stack) segmentArrivesNoConn(key connKey, ip ipv4.Header, t tcp.Header, 
 }
 
 // Read は、受信バッファに貯まったデータを p に移し、移したバイト数を返す。
-// 貯まっていなければ待たずに 0 を返す。
+// 貯まっていなければ待たずに 0 を返す。RFC 9293 3.10.3 RECEIVE Call に当たる。
 //
-// 仮の読み出し口。T6-7 のデモで main が呼ぶ。M8 で net.Conn の Read (データが来るまで
-// ブロックする) に置き換える。
+// 待つのは呼ぶ側 (tuntcp.Conn.Read) の役目。0 が返ったら、PeerClosed と Reset を見て、
+// これ以上届かないのか、まだ届くのかを区別する。
 func (c *Connection) Read(p []byte) int {
 	n, _ := c.rcvBuf.Read(p)
 	return n
@@ -648,8 +640,8 @@ func (c *Connection) Read(p []byte) int {
 // CLOSE-WAIT でも送れる (相手が送り終えただけで、こちらからの向きは開いている)。
 // 自分から閉じたあとの状態と、接続がないときはエラーを返す。
 //
-// 仮の書き込み口。T6-7 のデモで main が呼ぶ。M8 で net.Conn の Write に置き換える。
-// エラーの形 (net.OpError で包むかなど) は T8-5 で決める。
+// tuntcp.Conn.Write が呼ぶ。Accept が返すのは ESTABLISHED 以降の接続で、利用者が閉じたあとは呼ばないので、
+// いまエラーが返る場面はない。
 //
 // 送信バッファの上限 (maxSendBuffer) までしか積まない。積めたバイト数を返す。0 のこともある。
 // 仕様は、積めないときに "error: insufficient resources" を返すとしているが、エラーにはせず、
@@ -718,7 +710,7 @@ func (c *Connection) Release() {
 }
 
 // 利用者の呼び出しに返すエラー。文言は RFC 9293 3.10 の "error: ..." に合わせてある。
-// エラーの形 (net.OpError で包むかなど) は T8-5 で決める。
+// 利用者に見えるエラー (net.ErrClosed、ECONNRESET など) は、tuntcp の層が状態から決める。
 var (
 	errConnNotExist = errors.New("connection does not exist")
 	errConnClosing  = errors.New("connection closing")
@@ -741,7 +733,7 @@ var (
 //     あれば ESTABLISHED まで待つとしている。M8 の Accept は ESTABLISHED の接続だけを返すので、
 //     利用者が SYN-RECEIVED の接続を閉じる場面がない。エラーを返し、何も変えない)
 //
-// 仮の口。M8 で net.Conn の Close に置き換える。
+// 利用者が直接呼ぶ口はない。Release (net.Conn の Close) が、読み残しのないときに呼ぶ。
 func (c *Connection) Close() error {
 	switch c.State {
 	case tcp.StateEstablished:
@@ -823,8 +815,8 @@ func (c *Connection) output() {
 }
 
 // TakeOutgoing は、送信キューに積まれたパケットを積まれた順に返し、キューを空にする。
-// main が、受信セグメントを Handle に渡したあとと、Connection.Write を呼んだあとに呼び、
-// 返ったパケットを積まれた順に TUN に書く。
+// tuntcp のループが、入力 (受信セグメント、タイマー、API の呼び出し) を 1 つ処理するたびに呼び、
+// 返ったパケットを積まれた順にデバイスに書く。
 func (s *Stack) TakeOutgoing() [][]byte {
 	out := s.out
 	s.out = nil
@@ -844,10 +836,11 @@ func (s *Stack) TakeOutgoing() [][]byte {
 //   - RST を送ったあと TIME-WAIT に入る (3.5.2 の "The side of a connection issuing a reset should enter
 //     the TIME-WAIT state")。3.10.5 は "Delete the TCB, enter CLOSED state" としていて、節どうしで食い違う。
 //     イベントごとの手順を書いた 3.10.5 に従った (docs/design.md の「対話で決めた仕様」)
-//   - 待っている SEND と RECEIVE への "connection reset" の通知 (未実装。待つ呼び出しがまだない。T8-5)
 //
-// 仮の口。いまは main から呼ばれない。M8 で Listener の Close や、読み残しのある Close で使う。
-// 再送の上限に達したとき (T9-4) にも使う。
+// 待っている SEND と RECEIVE への通知は、tuntcp の層がやる。Abort を呼ぶのは、利用者が閉じたとき (Release)、
+// 待ち受けをやめたとき (CloseListener)、スタックを止めたとき (AbortAll)、accept キューが満杯のとき (enqueue) で、
+// どれも、待っている呼び出しは net.ErrClosed で返るか、そもそも無い。
+// 再送の上限に達したとき (T9-4) にも使う。そのときは、タイムアウトの通知が要る。
 func (c *Connection) Abort() error {
 	switch c.State {
 	case tcp.StateSynReceived, tcp.StateEstablished, tcp.StateFinWait1, tcp.StateFinWait2, tcp.StateCloseWait:

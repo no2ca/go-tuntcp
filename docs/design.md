@@ -15,31 +15,34 @@
 
 ```mermaid
 flowchart LR
-    tun_in["tun0 から読む<br/>(1)"] --> ip["ipv4.Parse<br/>(2)(4)"]
-    ip --> istcp{"TCP か"}
-    istcp -- いいえ --> skip["表示だけして捨てる<br/>(19)"]
-    istcp -- はい --> tcp["tcp.Parse<br/>(5)(4)"]
-    tcp --> stack["Stack.Handle<br/>(8)"]
+    tun_in["tun0 から読む<br/>readLoop (1)"] --> loop
+    api["Accept / Read / Write / Close<br/>deadline<br/>(21)(22)(17)"] -- "call" --> loop
+    tick["1 秒おき<br/>(18)"] --> loop
+    loop["イベントループ<br/>tuntcp.Stack.run<br/>(21)"] --> ip["ipv4.Parse、tcp.Parse<br/>(2)(4)(5)"]
+    ip --> stack["Stack.Handle<br/>(8)"]
     stack --> noconn["接続がない<br/>RST か SYN|ACK<br/>(9)(10)(11)"]
     stack --> conn["接続がある<br/>Connection.Handle<br/>(12)(13)"]
-    noconn --> build["返信を組み立てる<br/>(3)(6)"]
-    conn --> build
     conn --> rcvbuf["受信バッファ<br/>(14)"]
-    rcvbuf --> demo["仮のデモ<br/>Read / Write<br/>(17)"]
-    demo --> sndbuf["送信バッファ<br/>(15)"]
-    conn --> sndbuf
-    build --> queue["送信キュー<br/>TakeOutgoing<br/>(16)"]
+    conn --> acceptq["accept キュー<br/>(22)"]
+    loop --> serve["待っている呼び出しを進める<br/>serveAccepts、serveConns<br/>(17)(22)"]
+    serve --> rcvbuf
+    serve --> acceptq
+    serve --> sndbuf["送信バッファ<br/>(15)"]
+    noconn --> queue["送信キュー<br/>TakeOutgoing<br/>(16)"]
+    conn --> queue
     sndbuf --> queue
-    queue --> tun_out["tun0 に書く<br/>(1)"]
-    demo -- "Close" --> conn
-    tick["1 秒おき<br/>HandleTimeouts<br/>(18)"] --> conn
+    queue --> tun_out["tun0 に書く<br/>flush (1)"]
 ```
 
-送るパケットの出口は送信キュー 1 つ。受信セグメントへの返信（ACK、RST、SYN|ACK）も、データも、`Stack` が送る順に積む。`main` は 1 つのセグメントを処理するたびに、キューを取り出して積まれた順に TUN に書く。
+入力は 3 種類ある。デバイスから読んだパケット、一定の間隔のタイマー、API の呼び出し。`tuntcp.Stack.run` の goroutine が、これを 1 つずつ順に処理する。`internal/stack` の `Stack` に触るのはこの goroutine だけなので、ロックは持たない。
+
+入力を 1 つ処理するたびに、ループは次の 3 つをする。待っている `Accept` に接続を渡す（`serveAccepts`）。待っている `Read` と `Write` を進められるだけ進める（`serveConns`）。送信キューに積まれたパケットを、積まれた順にデバイスに書く（`flush`）。
+
+送るパケットの出口は送信キュー 1 つ。受信セグメントへの返信（ACK、RST、SYN|ACK）も、データも、`Stack` が送る順に積む。
 
 `Stack.Handle` から先の分岐は、[internal/stack/README.md](../internal/stack/README.md) に図と表がある。
 
-`cmd/tuntcp/main.go` が上の順に呼ぶ。`Stack.Handle` のあと、仮のデモ（`demoServer`）が受信バッファを読み、HTTP リクエストの終わりが届いていれば決まったレスポンスを書いて閉じる。これとは別に、1 秒おきに `Stack.HandleTimeouts` を呼び、期限の来たタイマーを処理させる。読み取りは別の goroutine（`readLoop`）で行い、チャネルでメインのループに渡す。`Stack` に触るのはメインの goroutine だけなので、ロックは持たない。
+`cmd/tuntcp/main.go` は、TUN デバイスを開いて `tuntcp.New` に渡し、`Listen` が返した `net.Listener` を `http.Serve` に渡すだけ。パケットの表示は、デバイスを包んだ `traced` がやる。
 
 ## 機能と実装の対応
 
@@ -62,15 +65,15 @@ flowchart LR
 | 11 | 初期シーケンス番号（ISS）を選ぶ | RFC 9293 3.4.1 | `Stack.ISS`、`randomISS` | なし | 一部。下の「仕様と合っていないもの」を参照 |
 | 12 | 接続のあるセグメントを、First〜Eighth の順に処理する | RFC 9293 3.10.7.4 | `Connection.Handle`、`tcp.SegmentAcceptable` | `TestHandle_*`（状態の名前ごと）、`TestSegmentAcceptable` | 一部。下の表を参照 |
 | 13 | LISTEN か CLOSED になった接続をテーブルから消す | RFC 9293 3.10.7.4、3.10.5、3.10.8（TCB の削除） | `Stack.reap` | `TestHandle_SynReceived_NewSYNInWindow_ReturnsToListen`、`TestHandle_LastAck_ACK`、`TestAbort_SendsRST`、`TestTimeWait_ExpiresAfter2MSL` | 済 |
-| 14 | 受け取ったデータを受信バッファに貯め、利用者が読み出す | RFC 9293 3.10.7.4 Seventh、3.10.3 | `Connection.Read`（仮の口） | `TestRead_*` | 一部。上限と広告ウィンドウとの結びつきは未（M10） |
-| 15 | 利用者が書いたデータを送信バッファに積み、ウィンドウと MSS に収まる分を切り出して送る | RFC 9293 3.10.2、3.9.1.2（PSH）、3.7.1（MSS 536） | `Connection.Write`（仮の口）、`Connection.output` | `TestWrite_*`、`TestHandle_Established_ACK_SendsRemainingData` | 一部。再送（M9）、probe と Nagle（M10）、MSS の交換（M11）は未 |
-| 16 | 送るパケットをすべて送信キューに積み、`main` が取り出して TUN に書く | 仕様なし（「対話で決めた仕様」） | `Stack.TakeOutgoing` | `TestHandle_Established_DataAndWindowOpen_QueuesACKThenData`、ほかのテストも `handle` と `takeSent` でキューから取り出す | 済 |
-| 17 | HTTP リクエストに固定のレスポンスを返して閉じる仮のデモ | 仕様なし（M8 で捨てる） | `cmd/tuntcp` の `demoServer`、`Stack.Conn` | `task e2e` の検証（本文の一致、レスポンスへの ACK、切断） | 済 |
-| 18 | 切断する。FIN を送って閉じ、相手の FIN を受け、TIME-WAIT を 2MSL で終える。RST を送って捨てる | RFC 9293 3.6、3.10.4、3.10.5、3.10.7.4 Eighth、3.10.8 | `Connection.Close`、`Connection.Abort`（どちらも仮の口）、`Stack.HandleTimeouts`、`Stack.Now` | `TestClose_*`、`TestAbort_*`、`TestTimeWait_*`、`task e2e` の検証（両方の向きの切断、`ss -tn` に残らない） | 済。`Abort` は実機で確かめていない。利用者への通知は未（T8-5） |
-| 19 | 受信と送信のパケットを画面に表示する | 仕様なし | `cmd/tuntcp` の `display*` | なし | 済 |
+| 14 | 受け取ったデータを受信バッファに貯め、利用者が読み出す | RFC 9293 3.10.7.4 Seventh、3.10.3 | `Connection.Read`、`PeerClosed`、`Reset` | `TestRead_*`、`TestPeerClosed*`、`TestReset` | 一部。上限と広告ウィンドウとの結びつきは未（M10） |
+| 15 | 利用者が書いたデータを送信バッファ（上限 65535 バイト）に積み、ウィンドウと MSS に収まる分を切り出して送る | RFC 9293 3.10.2、3.9.1.2（PSH）、3.7.1（MSS 536）。上限は「対話で決めた仕様」の「net.Conn」 | `Connection.Write`、`Connection.output` | `TestWrite_*`、`TestHandle_Established_ACK_SendsRemainingData` | 一部。再送（M9）、probe と Nagle（M10）、MSS の交換（M11）は未 |
+| 16 | 送るパケットをすべて送信キューに積み、ループが取り出してデバイスに書く | 仕様なし（「対話で決めた仕様」） | `Stack.TakeOutgoing`、`tuntcp.Stack.flush` | `TestHandle_Established_DataAndWindowOpen_QueuesACKThenData`、ほかのテストも `handle` と `takeSent` でキューから取り出す | 済 |
+| 17 | `net.Conn`。`Read` と `Write` は進められるまで待ち、`Close`、相手の FIN と RST、deadline で返る。どの goroutine からも同時に呼べる | 仕様なし（[roadmap.md](roadmap.md) の T8-4〜T8-7、「対話で決めた仕様」の「net.Conn」）。読み残しのある `Close` は RFC 9293 3.6.1 SHLD-3 | `tuntcp.Conn`（`conn.go`）、`stack.Connection.Release` | `TestConn_*`（`conn_test.go`）、`TestRelease_*`、`task e2e` の検証（`net/http` がこの上で動く） | 済。`nettest.TestConn` は未（T12-2） |
+| 18 | 切断する。FIN を送って閉じ、相手の FIN を受け、TIME-WAIT を 2MSL で終える。RST を送って捨てる | RFC 9293 3.6、3.10.4、3.10.5、3.10.7.4 Eighth、3.10.8 | `Connection.Close`、`Connection.Abort`、`Stack.HandleTimeouts`、`Stack.Now` | `TestClose_*`、`TestAbort_*`、`TestTimeWait_*`、`TestStack_TimeWaitExpires`、`task e2e` の検証（両方の向きの切断、`ss -tn` に残らない） | 済。`Abort` は実機で確かめていない |
+| 19 | 受信と送信のパケットを画面に表示し、`net/http` のサーバを動かすサンプル | 仕様なし | `cmd/tuntcp` の `main`、`traced` | `task e2e` の検証（ステータス 200 と本文、ハンドラのないパスの 404） | 済 |
 | 20 | 実機で動かし、記録を検証する | [roadmap.md](roadmap.md) の M0 | `scripts/e2e.sh`、`scripts/e2e-check.sh` | 記録を差し替えて、落ちるべきときに落ちることを確かめた | 済 |
-| 21 | イベントループ。デバイスから読んだパケット、タイマー、API の呼び出しを 1 つの goroutine で順に処理し、送信キューをデバイスに書く。`Close` で接続を捨てて止まる | 仕様なし（「対話で決めた仕様」の「API とパッケージの形」） | `tuntcp.New`、`Stack.Listen`、`Stack.Close`、`stack.Stack.AbortAll` | `TestStack_*`（直下の `tuntcp_test.go`）、`TestAbortAll_*` | 一部。`cmd/tuntcp` はまだ使っていない（T8-8）。`net.Conn` は未（T8-4 から） |
-| 22 | handshake の終わった接続を accept キューに入れ、`Accept` で待っている呼び出しに渡す。待ち受けをやめる | 仕様なし（「対話で決めた仕様」の「accept キュー」） | `stack.Stack.Listen` / `Accept` / `CloseListener`、`tuntcp.Listener` | `TestAccept_*`、`TestListen_*`、`TestCloseListener_*`、`TestListener_*` | 済。実機では確かめていない（T8-8） |
+| 21 | イベントループ。デバイスから読んだパケット、タイマー、API の呼び出しを 1 つの goroutine で順に処理し、送信キューをデバイスに書く。`Close` で接続を捨てて止まる | 仕様なし（「対話で決めた仕様」の「API とパッケージの形」） | `tuntcp.New`、`Stack.Listen`、`Stack.Close`、`stack.Stack.AbortAll` | `TestStack_*`（直下の `tuntcp_test.go`）、`TestAbortAll_*` | 済 |
+| 22 | handshake の終わった接続を accept キューに入れ、`Accept` で待っている呼び出しに渡す。待ち受けをやめる | 仕様なし（「対話で決めた仕様」の「accept キュー」） | `stack.Stack.Listen` / `Accept` / `CloseListener`、`tuntcp.Listener` | `TestAccept_*`、`TestListen_*`、`TestCloseListener_*`、`TestListener_*`、`task e2e` | 済。満杯のときの RST と `Listener.Close` は実機で確かめていない |
 | 23 | 再送、フロー制御、MSS | [roadmap.md](roadmap.md) の M9〜M11 | — | — | 未 |
 
 12 の内訳。RFC 9293 3.10.7.4 の 8 つの段階ごとの状態。
@@ -97,27 +100,24 @@ flowchart LR
 - `defaultWndSize = 65535`: なぜこの値かが、どこにも書いていない。受信バッファと結びついていない（M10 で直る）
 - RST のウィンドウの欄: 接続のあるとき（`Connection.Handle`）は `c.Rcv.WND`、ないとき（`buildRST`）は `defaultWndSize` を入れている。RFC 9293 は RST のウィンドウの値を決めていない。揃っておらず、理由も書いていない
 - `Stack.Handle` の `// TODO: セキュリティ情報が...`: 省略と決めたのか、未実装なのかが書いていない
-- `cmd/tuntcp` が、送ったパケットをもう一度パースしている: 表示のためだけの処理（T6-7 で、パースのエラーを捨てずにログに出すようにした）
-- どのテストも通らない行: `randomISS` の中身（テストは `Stack.ISS` を差し替えるため）、`Stack.Conn`（`main` のデモだけが使う。`task e2e` では通る）
-- `main` が `HandleTimeouts` を呼ぶ間隔の 1 秒: 2MSL が 4 分なので足りる、という以上の根拠がない。`task e2e` は 4 分待たないので、この呼び出しが働くことは記録に残る形では確かめていない（T7-5 で、MSL を一時的に縮めて 1 回だけ手で確かめた）。M8 のイベントループで置き換える
-- `Connection.Abort` は、`Stack.AbortAll`（`tuntcp.Stack.Close`）からだけ呼ばれる。実機では確かめていない。T8-4 と T9-4 でも使う
-- `tuntcp` のループが `HandleTimeouts` を呼ぶ行は、どのテストも通らない。タイマーが外から見えるようになるのは、`Conn.Close` で TIME-WAIT に入れるようになる T8-4。間隔の 1 秒は `main` と同じで、根拠も同じ
-- `tuntcp` は、読めないパケットを黙って捨て、デバイスへの書き込みのエラーも捨てる。デバイスが `Close` 以外の理由で読めなくなっても、利用者に伝えない。どれも扱いを決めていない
-- `tuntcp.Conn` のメソッドは、`errNotImplemented` を返すだけの仮のもの。`Accept` が `net.Conn` を返すために型が要る。T8-4 と T8-6 で中身を入れる
-- `cmd/tuntcp` の `main` は、使わない accept キューを毎回空にしている。仮のデモが接続を `Stack.Conn` で引くため。T8-8 で消える
-- イベントループが 2 つある: `tuntcp.Stack.run` と、`cmd/tuntcp` の `main`。`main` は仮のデモのために残してあり、T8-8 で `tuntcp` に置き換える
+- どのテストも通らない行: `randomISS` の中身（テストは `Stack.ISS` を差し替えるため。`task e2e` では通る）、`tuntcp.Conn.tryWrite` の「書けない状態」の分岐（いまは起きない。再送の上限で接続を捨てる T9-4 で起きるようになる）
+- ループが `HandleTimeouts` を呼ぶ間隔の 1 秒（`tuntcp.timeoutInterval`）: 2MSL が 4 分なので足りる、という以上の根拠がない。再送タイマーを入れる M9 で、次の期限まで待つ形に変える。呼び出しが働くことは `TestStack_TimeWaitExpires` が確かめる（時計と間隔を差し替える）
+- `Connection.Abort` で RST を送る場面（読み残しのある `Close`、閉じたあとのデータ、`Listener.Close`、`Stack.Close`、accept キューの満杯）は、どれも実機では確かめていない。`task e2e` は「RST が流れていない」ことを見ている
+- `tuntcp` は、読めないパケットを黙って捨て、デバイスへの書き込みのエラーも捨てる。デバイスが `Close` 以外の理由で読めなくなっても、利用者に伝えない。どれも扱いを決めていない（`cmd/tuntcp` の `traced` は、読み書きのエラーをログに出す）
+- `maxSendBuffer = 65535`: 広告ウィンドウと同じ値にしただけで、ほかに根拠がない（M10 で見直す）
+- deadline のタイマー（`conn.go` の `deadline`）は、`Close` と `SetDeadline` で止めるが、`Stack.Close` では止めない。期限が来たときに何もせずに終わるだけで、害はない
 
 ## パッケージ
 
 | パッケージ | 役割 |
 |---|---|
-| `internal/tun` | `/dev/net/tun` を開き、ioctl で TUN デバイスを作る |
+| `internal/tun` | `/dev/net/tun` をノンブロッキングで開き、ioctl で TUN デバイスを作る。`Close` で、待っている `Read` が返る |
 | `internal/checksum` | インターネットチェックサム（`Sum` / `Fold`） |
 | `internal/ipv4` | IPv4 ヘッダの `Parse` / `Serialize` とチェックサムの検証 |
 | `internal/tcp` | TCP ヘッダの `Parse` / `Serialize`、フラグ、シーケンス番号の比較、状態（`State`）、TCB（`ControlBlock`） |
-| `tuntcp`（リポジトリの直下。import は `"go-tuntcp"`） | 公開する API。イベントループの goroutine を持ち、デバイスの読み書きと `internal/stack` の呼び出しを 1 本に並べる。`net.Listener`（`Listener`）がある。`net.Conn`（`Conn`）は型だけで、中身は T8-4 から |
+| `tuntcp`（リポジトリの直下。import は `"go-tuntcp"`） | 公開する API。`Stack`（`tuntcp.go`。イベントループと `Listener`）と `Conn`（`conn.go`）。goroutine、チャネル、デバイスの読み書き、deadline のタイマーを持ち、`internal/stack` の呼び出しを 1 本に並べる |
 | `internal/stack` | 接続の管理と、受信セグメントの処理。並行処理は持たない。分岐ごとの図と表は [README](../internal/stack/README.md) |
-| `cmd/tuntcp` | エントリポイント。TUN を開き、80 番を LISTEN し、パケットを表示しながら `Stack` に渡す。1 秒おきにタイマーを処理させる。HTTP に固定のレスポンスを返して閉じる仮のデモを持つ |
+| `cmd/tuntcp` | サンプル。TUN を開き、`tuntcp` の上で `http.Serve` を 80 番で動かす。流れたパケットを表示する |
 
 ## internal/stack
 
@@ -131,6 +131,8 @@ flowchart LR
   - 受信バッファ: 受け取ったが読まれていないデータ。末尾が RCV.NXT の直前に当たる
   - 送信バッファ: 書かれたが ACK されていないデータ。先頭が SND.UNA に当たり、先頭から SND.NXT - SND.UNA バイトは送信済み
 - `Connection.Handle` は RFC 9293 3.10.7.4 の First〜Eighth の順に並べる。段階ごとの状態は、上の「12 の内訳」の表にある。処理のあと、送れるようになったデータを送る（`output`）
+- `Stack.Listen` / `Accept` / `CloseListener` は、待ち受けと accept キューを扱う。`Accept` は待たずに、キューの先頭か nil を返す
+- 利用者に向いた口は、待たない形にしてある。`Connection.Read`（貯まっている分か 0）、`Write`（積めた分のバイト数）、`PeerClosed`、`Reset`、`Release`（`net.Conn` の `Close`）。待つこと、起こすこと、エラーの形を決めることは `tuntcp` の層がやる
 - `Connection.Write` は送信バッファに積んで `output` を呼ぶ。`output` は SND.NXT から、相手のウィンドウ（SND.UNA + SND.WND の手前）と MSS 536 に収まる分を切り出し、送信キューに積む
 - `Connection.Close` は状態を FIN-WAIT-1 か LAST-ACK に移して `output` を呼ぶ。`output` は、データを送り切ったあとに FIN を送る。`Connection.Abort` は RST を送って接続を消す
 - `Stack.HandleTimeouts()` は、`Stack.Now()` の時刻と接続ごとのタイマー（`timer`）の期限を比べ、期限の来たものを処理する。いまあるのは TIME-WAIT の 2MSL だけ
@@ -147,6 +149,22 @@ flowchart LR
 ## 対話で決めた仕様
 
 RFC が決めていない、または RFC の推奨から意図して外れた振る舞い。
+
+- **net.Conn**（2026-11-16、T8-4〜T8-6。AI が案を出し、人間が決めた。`Read` / `Write` / deadline / エラーの振る舞いそのものは [roadmap.md](roadmap.md) の T8-4〜T8-6 に書いてある）
+  - **読み残しがあるまま `Close`**: `Abort`（RST）で捨てる。RFC 9293 3.6.1 SHLD-3 のとおり。捨てた案: FIN で閉じて、読み残しを黙って捨てる（相手は、データが読まれたと思い込む）
+  - **`Close` のあとにデータが届いた**: 同じく RST（SHLD-3 の後半）。対象は、RCV.NXT から始まる新しいデータだけ。捨てた案: ACK を返して捨て続ける
+  - **`Close` のあとに相手の FIN を待つ時間**: 上限なし。捨てた案: 一定時間で捨てる（RFC になく、再送のない間は値の根拠がない）
+  - **`Write` が待つ条件**: 送信バッファの上限を 65535 バイトにし、空きがなければ待つ。空いた分だけ積み、全部積めたら返る。受信バッファの上限は M10 のまま
+  - **`Write` が返る時点**: 送信バッファに積めた時点。相手の ACK は待たない（標準の `net.Conn` と同じ）
+  - AI が足したもの（人間の確認待ち）
+    - 期限が過ぎていれば、データが貯まっていても `Read` はタイムアウトを返す（標準の `net` と同じ。データは残る）
+    - 長さ 0 のバッファの `Read` は、待たずに `(0, nil)`
+    - 相手の RST の前に受け取ってあったデータは読める。読み切ったあとで `ECONNRESET`。`Write` はすぐ `ECONNRESET`
+    - エラーで返る `Write` は、それまでに積めたバイト数も返す。積めた分は送られる
+    - 同時に呼んだ `Read` 同士、`Write` 同士は、呼ばれた順に 1 つずつ済ませる。`Write` のデータは混ざらない
+    - 2 回目の `Close` と、`Close` のあとの deadline の設定は `net.ErrClosed`。相手の RST で消えた接続の、1 回目の `Close` は nil
+    - エラーの `*net.OpError` の `Op` は、`read` / `write` / `close` / `set` / `accept` / `listen`。`ECONNRESET` と `EADDRINUSE` は、標準と同じく `*os.SyscallError` を挟む
+    - `Stack.Close` のあとは、`Conn` のどのメソッドも `net.ErrClosed`
 
 - **accept キュー**（2026-11-16、T8-3。AI が案を出し、人間が決めた）
   - **上限**: `Listener` ごとに 128 本（`stack.maxAcceptQueue`）。入るのは handshake の終わった接続で、ESTABLISHED になった順に並ぶ。捨てた案: 上限なし（`Accept` を呼ばないサーバにつなぎ続けると、メモリが増え続ける）
@@ -179,7 +197,7 @@ RFC が決めていない、または RFC の推奨から意図して外れた�
     - **FIN にも、相手のウィンドウの空きを 1 つ求める。** FIN はシーケンス番号を 1 つ使い、ウィンドウの外のセグメントは相手の First の検査で受理されない。空きがなければ、ウィンドウが開くのを待つ。ウィンドウが 0 のまま開かないと FIN を送れない（データと同じ。ゼロウィンドウ probe は T10-2）
     - **時計は `Stack.Now func() time.Time` で注入し、タイマーは `Stack.HandleTimeouts()` が呼ばれたときに調べる。** `main` が 1 秒おきに呼ぶ。捨てた案: `Handle` や `HandleTimeouts` の引数で時刻を渡す（Close や Write もタイマーを動かすようになる M9 で、利用者の呼び出しごとに時刻を渡すことになる）。次の期限を `Stack` に聞いて、そこまで待つ（再送タイマーを入れる M9 か、M8 のイベントループで要る。2MSL だけなら 1 秒おきで足りる）
     - **MSL は 2 分**（RFC 9293 3.4.2 の値）。TIME-WAIT は 4 分。差し替える口は作っていない。Linux は TIME-WAIT を 60 秒にしている（確かめたのは `task e2e` の記録ではなく、一般に知られた値）
-  - 仮の口
+  - 仮の口（M8 で、利用者の口は `tuntcp.Conn` と `tuntcp.Listener` に置き換わった。`cmd/tuntcp` のデモも消えた）
     - `Connection.Close() error` と `Connection.Abort() error`。どちらも M8 で `net.Conn` と `net.Listener` に置き換える
     - エラーは、RFC 9293 3.10 の文言の 2 つ（"connection does not exist"、"connection closing"）。形は T8-5 で決める
     - **SYN-RECEIVED での Close は実装しない。** エラーを返し、何も変えない。仕様は「送るデータがなければすぐ FIN を送って FIN-WAIT-1 に、あれば ESTABLISHED まで待つ」としている。M8 の `Accept` は ESTABLISHED の接続だけを返すので、利用者が SYN-RECEIVED の接続を閉じる場面がない
@@ -192,7 +210,7 @@ RFC が決めていない、または RFC の推奨から意図して外れた�
   - 1 つのセグメントの処理で返信とデータの両方を送るときは、返信、データの順に積む
   - 捨てた案: 返信だけを `Stack.Handle` の戻り値で返し、データは送信キューから出す（T6-3 から T7-0 までの形）。送る順番を `main` が守ることになる。再送する SYN|ACK（T9-2）や Close で送る FIN（T7-4）は受信を起点にしないので、同じ種類のセグメントが 2 つの出口に分かれる。ACK をデータに相乗りさせることもできない
 
-- **仮の読み書き口**（2026-11-11、T6-4、T6-7。人間が「自走してよい」としたので AI が決めた。2026-11-14 に人間が承認した）
+- **仮の読み書き口**（M8 で置き換わった。`Stack.Conn` と `demoServer` は消え、`Connection.Write` は積めたバイト数を返すようになった。送るタイミングと PSH の決めごとは、いまも生きている。2026-11-11、T6-4、T6-7。人間が「自走してよい」としたので AI が決めた。2026-11-14 に人間が承認した）
   - 仮の口は 3 つ: `Connection.Read(p) int`（貯まっている分を移す。なければ待たずに 0）、`Connection.Write(p) error`（積んで送れる分を送る）、`Stack.Conn(local, remote)`（`main` が受信セグメントのアドレスから接続を引く）。どれも M8 で `net.Listener` / `net.Conn` に置き換える
   - `Write` は SYN-RECEIVED と ESTABLISHED で受け付ける（RFC 9293 3.10.2。SYN-RECEIVED では積むだけ）。それ以外ではエラーを返す。エラーの形は T8-5 で決める
   - 送るタイミング: `Write` の直後と、受信セグメントを処理した直後。Nagle などで待つことはしない（T10-3）
@@ -210,20 +228,19 @@ RFC が決めていない、または RFC の推奨から意図して外れた�
 ## いまの制限
 
 - 送信するセグメントに TCP オプションを付けない（`DataOffset` は 5 固定）。受信したオプションは読み捨てる
-- 相手の FIN を受けたことを、利用者に伝える口がない。`Read` は 0 を返すだけ（T8-5）
-- 再送しないので、FIN や、FIN への ACK が落ちると、切断が途中で止まる（M9）。FIN-WAIT-2 で相手の FIN を待つ時間にも上限がない
+- 自分から接続できない（`Dial` がない）。待ち受けは、宛先の IP アドレスを見ない
+- `Read` で受信バッファが空いても、相手に伝えない。広告ウィンドウは 65535 のままで、受信バッファに上限がない（M10）
+- 再送しないので、FIN や、FIN への ACK が落ちると、切断が途中で止まる（M9）。FIN-WAIT-2 で相手の FIN を待つ時間にも上限がない（`Close` のあとに相手が閉じなければ、接続が残り続ける）
 - TIME-WAIT の間（4 分）、同じアドレスとポートの組からの新しい SYN を受け付けない
 - 送ったデータを再送しない。落ちたら接続が止まる（M9）
-- 受信バッファと送信バッファに上限がなく、広告ウィンドウは 65535 のまま（M10）
-- `Read` と `Write` は仮の口で、`Read` は待たずに 0 を返す。`main` の 1 つの goroutine からしか呼べない（M8）
 - データを受けると ACK を返し、そのあとに送るデータは別のセグメントになる（ACK を相乗りさせない）
 
 ## これから変えるところ
 
-マイルストーンが進むと、いまの「受信 1 つに返信 1 つ」の形では足りなくなる。次の順に広げる。
+「受信 1 つに返信 1 つ」の形から、次の順に広げてきた。残っているのは、再送タイマーのために「次の期限まで待つ」形にすること（M9）。
 
-1. **送信キュー（M6 と T7-0、済）**: `Stack` が送りたいパケットをキューに積み、`main` がそれを TUN に書く。`Handle` は戻り値を持たず、送るものはすべてキューを通る
+1. **送信キュー（M6 と T7-0、済）**: `Stack` が送りたいパケットをキューに積み、ループがそれをデバイスに書く。`Handle` は戻り値を持たず、送るものはすべてキューを通る
 2. **時計の注入（M7、済）**: タイマー（2MSL、再送、persist）のために、時刻を外から渡す（`Stack.Now`）。テストでは時間を手で進める。いまは 2MSL だけ
-3. **イベントループ（M8。T8-2 でループだけ済）**: `stack.Stack` を 1 つの goroutine（`tuntcp.Stack.run`）が持ち、受信したパケット、タイマー、API の呼び出しをチャネルで受ける。API のメソッドは、ループの上で実行する関数を渡して、終わるまで待つ（`tuntcp.Stack.call`）。`net.Listener` と `net.Conn` のメソッドも、この口を通す（T8-3 から）
+3. **イベントループ（M8、済）**: `stack.Stack` を 1 つの goroutine（`tuntcp.Stack.run`）が持ち、受信したパケット、タイマー、API の呼び出しをチャネルで受ける。API のメソッドは、ループの上で実行する関数を渡して、終わるまで待つ（`tuntcp.Stack.call`）。`net.Listener` と `net.Conn` のメソッドも、この口を通す。すぐに済まない `Accept` / `Read` / `Write` は待ち行列に入り、ループが入力のたびに見直す
 
 接続は「入力（セグメント、タイマーの満了、API の呼び出し）を受けて、TCB を更新し、送るセグメントを出す」状態機械として保つ。この形は 3 つの変更を通して変えない。

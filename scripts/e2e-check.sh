@@ -84,11 +84,18 @@ response_acked() {
         END { exit !found }'
 }
 
-# curl が受け取った本文が、デモの決まった本文と一致する。
-# 期待する本文は cmd/tuntcp/main.go の demoBody と同じもの。curl はステータス行とヘッダを
+# curl が受け取った本文が、ハンドラの返す本文と一致する。
+# 期待する本文は cmd/tuntcp/main.go の helloBody と同じもの。curl はステータス行とヘッダを
 # 解釈し、Content-Length の分だけ本文を受け取ってから書き出すので、HTTP として読めたことも含む
 body_received() {
   [[ -f "$OUT/curl.txt" ]] && [[ "$(cat "$OUT/curl.txt")" == "hello from go-tuntcp" ]]
+}
+
+# --- M8: net/http のサーバ ---
+
+# http.Serve が返したステータス。curl の -w '%{http_code}' の出力
+status_is() { # $1: 記録、$2: 期待するステータス
+  [[ -f "$1" ]] && [[ "$(cat "$1")" == "$2" ]]
 }
 
 # --- M7: 切断 ---
@@ -141,7 +148,9 @@ check "クライアントが SYN|ACK に ACK を返した (handshake の完了)"
 check "RST が流れていない" no_rst
 check "クライアントのデータに、その末尾までの ACK を返した" data_acked
 check "クライアントが、レスポンスのデータの末尾までを ACK した" response_acked
-check "curl が、決まった HTTP レスポンスの本文を受け取った" body_received
+check "curl が、ハンドラの返す本文を受け取った" body_received
+check "http.Serve がステータス 200 を返した" status_is "$OUT/curl.status" 200
+check "ハンドラのないパスに、http.Serve が 404 を返した" status_is "$OUT/curl-404.status" 404
 check "curl が終了コード 0 で終わった" curl_succeeded
 check "自作スタックが FIN を送り、クライアントがそれを ACK した" our_fin_acked
 check "クライアントの FIN に ACK を返した" peer_fin_acked

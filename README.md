@@ -1,11 +1,12 @@
 # go-tuntcp
 
-TUN デバイスの上に、Go でユーザー空間の TCP プロトコルスタックを実装するプロジェクトです。TUN デバイスから生の IP パケットを読み書きし、IPv4 と TCP を自前で処理します。ひとまずの目標は、自作の型が `net.Listener` と `net.Conn` を満たし、標準の `net/http` サーバがその上でそのまま動くことです。いまは 3-way handshake で接続を確立するところまで動きます。
+TUN デバイスの上に、Go でユーザー空間の TCP プロトコルスタックを実装するプロジェクトです。TUN デバイスから生の IP パケットを読み書きし、IPv4 と TCP を自前で処理します。ひとまずの目標は、自作の型が `net.Listener` と `net.Conn` を満たし、標準の `net/http` サーバがその上でそのまま動くことです。いまは、公開パッケージ `tuntcp` の `Listener` と `Conn` の上で `http.Serve` が動き、`curl` に応答します。再送とフロー制御はまだありません。
 
 ## ディレクトリ構成
 
 ```
-cmd/tuntcp/         エントリポイント (TUN を開き、80 番を LISTEN してパケットを処理する)
+tuntcp.go, conn.go  公開する API (package tuntcp)。イベントループ、net.Listener、net.Conn
+cmd/tuntcp/         サンプル (TUN を開き、自作スタックの上で http.Serve を 80 番で動かす)
 internal/tun/       TUN デバイスの作成 (ioctl)
 internal/checksum/  インターネットチェックサム (Sum / Fold)
 internal/ipv4/      IPv4 ヘッダのパース・シリアライズ
