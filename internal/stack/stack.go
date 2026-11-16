@@ -112,6 +112,16 @@ type Connection struct {
 	// Close を呼んでも、送信バッファのデータを送り切るまで FIN は送らないので、状態だけでは分からない
 	finSent bool
 
+	// finReceived は、相手の FIN を処理したかどうか。接続が CLOSED になったあとも残る。
+	// 利用者の Read が、読み切ったあとに io.EOF を返すのに使う (PeerClosed)
+	finReceived bool
+
+	// reset は、相手の RST で接続が消えたかどうか。利用者の Read と Write が ECONNRESET を返すのに使う (Reset)
+	reset bool
+
+	// released は、利用者が接続を手放したかどうか (Release)。手放したあとに新しいデータが届いたら、RST を送る
+	released bool
+
 	// timeWait は TIME-WAIT の 2MSL タイマー。TIME-WAIT に入るときに動かす
 	timeWait timer
 
@@ -215,15 +225,18 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 	// やっていないこと:
 	//   - RFC 5961 の challenge ACK (SEG.SEQ が RCV.NXT と一致しない RST には ACK を返すだけにする)。
 	//     意図して省いた。目標のあとで足す。いまはウィンドウ内の RST ならどれでも接続を閉じる
-	//   - 利用者への "connection reset" の通知と、再送キューの破棄 (未実装。通知する相手もキューもまだ無い。M8、M9)
+	//   - 再送キューの破棄 (未実装。キューがまだ無い。M9)
 	if t.HasFlag(tcp.FlagRST) {
 		switch c.State {
 		case tcp.StateSynReceived:
 			// passive open しか無いので、常に LISTEN に戻る
 			c.State = tcp.StateListen
 		default:
-			// 同期済みの状態 (ESTABLISHED から TIME-WAIT まで) は、どれも CLOSED にする
+			// 同期済みの状態 (ESTABLISHED から TIME-WAIT まで) は、どれも CLOSED にする。
+			// "any outstanding RECEIVEs and SEND should receive "reset" responses": reset を立てておき、
+			// tuntcp.Conn の Read と Write がそれを見て ECONNRESET を返す
 			c.State = tcp.StateClosed
+			c.reset = true
 		}
 		return nil
 	}
@@ -357,6 +370,14 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 	receiving := c.State == tcp.StateEstablished || c.State == tcp.StateFinWait1 || c.State == tcp.StateFinWait2
 	if receiving && len(payload) > 0 {
 		if t.Seq == c.Rcv.NXT {
+			// RFC 9293 3.6.1 SHLD-3: 利用者が接続を手放したあとに新しいデータが届いたら、RST を送って
+			// データが失われたことを相手に知らせる ("if new data is received after CLOSE is called")。
+			// 読む人がいないので、受け取っても捨てるしかない。
+			// RCV.NXT から始まらないデータは新しいデータとして受け取らないので、下の ACK だけを返す
+			if c.released {
+				c.State = tcp.StateClosed
+				return buildSegment(c.Key.Local, c.Key.Remote, tcp.FlagRST, c.Snd.NXT, 0, c.Rcv.WND, nil)
+			}
 			c.rcvBuf.Write(payload)
 			c.Rcv.NXT += uint32(len(payload))
 		}
@@ -377,11 +398,12 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 	// 仕様の文面どおり RCV.NXT を進めて ACK を返す (状態は "Remain")。相手の誤りでしか起きない。
 	// 再送された FIN は SEG.SEQ が RCV.NXT の手前なので、First で落ちてここには来ない。
 	//
-	// やっていないこと:
-	//   - 利用者への "connection closing" の通知 (未実装。Read が io.EOF を返すようにするのは T8-5)
+	// 利用者への "connection closing" の通知は、finReceived を立てておき、tuntcp.Conn の Read が
+	// 受信バッファを読み切ったあとに io.EOF を返すことで行う。
 	if t.HasFlag(tcp.FlagFIN) {
 		if t.Seq+uint32(len(payload)) == c.Rcv.NXT {
 			c.Rcv.NXT++
+			c.finReceived = true
 			switch c.State {
 			case tcp.StateEstablished:
 				// SYN-RECEIVED で受けた FIN もここに来る。Fifth を通った時点で ESTABLISHED になっている
@@ -409,7 +431,7 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 }
 
 type Stack struct {
-	listeners map[uint16]struct{}     // LISTEN中のポート
+	listeners map[uint16]*listener    // LISTEN中のポート
 	conns     map[connKey]*Connection // 確立中の接続（SYN-RECEIVED以降）
 	ISS       func() uint32           // 初期シーケンス番号の生成
 	out       [][]byte                // 送信キュー。送るパケットはすべてここを通る。TakeOutgoing で取り出す
@@ -418,7 +440,7 @@ type Stack struct {
 
 func New() *Stack {
 	return &Stack{
-		listeners: make(map[uint16]struct{}),
+		listeners: make(map[uint16]*listener),
 		conns:     make(map[connKey]*Connection),
 		ISS:       randomISS,
 		Now:       time.Now,
@@ -431,16 +453,82 @@ func randomISS() uint32 {
 	return binary.BigEndian.Uint32(b[:])
 }
 
-// Conn は、自分と相手のアドレスとポートの組で接続を引く。なければ nil。
-//
-// 仮の口。T6-7 のデモで、main が受信セグメントの宛先と送信元から接続を引き、
-// Connection.Read と Write を呼ぶために使う。M8 で net.Listener の Accept に置き換える。
-func (s *Stack) Conn(local, remote netip.AddrPort) *Connection {
-	return s.conns[connKey{Local: local, Remote: remote}]
+// ErrPortInUse は、すでに待ち受けているポートに Listen したときのエラー。
+var ErrPortInUse = errors.New("port already in use")
+
+// maxAcceptQueue は、accept キューに入る接続の上限。
+// RFC にはない値で、docs/design.md の「対話で決めた仕様」の「accept キュー」で決めた。
+const maxAcceptQueue = 128
+
+// listener は、待ち受けているポート 1 つ。
+type listener struct {
+	// queue は accept キュー。handshake が終わり、利用者がまだ Accept で取り出していない接続が、
+	// ESTABLISHED になった順に入っている。入ったあとで CLOSED になった接続 (相手の RST など) も、取り出されるまで残る
+	queue []*Connection
 }
 
-func (s *Stack) Listen(port uint16) {
-	s.listeners[port] = struct{}{}
+// Listen は、port で接続を待ち受ける (RFC 9293 3.10.1 の passive OPEN。相手は指定しない)。
+// すでに待ち受けているポートなら ErrPortInUse を返す。2 つの待ち受けが同じキューを分け合うと、
+// どちらを閉じたときに止まるのかが決まらないため。
+func (s *Stack) Listen(port uint16) error {
+	if _, ok := s.listeners[port]; ok {
+		return ErrPortInUse
+	}
+	s.listeners[port] = &listener{}
+	return nil
+}
+
+// Accept は、port の accept キューの先頭の接続を取り出す。なければ nil。待たない。
+// 待つのは呼ぶ側 (tuntcp.Listener.Accept) の役目で、入力を 1 つ処理するたびにこれを呼び直す。
+func (s *Stack) Accept(port uint16) *Connection {
+	l := s.listeners[port]
+	if l == nil || len(l.queue) == 0 {
+		return nil
+	}
+	c := l.queue[0]
+	l.queue = l.queue[1:]
+	return c
+}
+
+// enqueue は、handshake の終わった接続を accept キューに入れる。SYN-RECEIVED の接続に届いた
+// セグメントを処理したあとに、Stack.Handle が呼ぶ。SYN-RECEIVED のままか、LISTEN や CLOSED に
+// 戻った接続には何もしない。
+//
+// キューが満杯なら、Abort で RST を送って捨てる。
+// 捨てた案: 満杯の間は SYN を無視する。相手の SYN の再送に頼ることになり、待ち時間が相手の RTO 次第になる。
+func (s *Stack) enqueue(c *Connection) {
+	switch c.State {
+	case tcp.StateSynReceived, tcp.StateListen, tcp.StateClosed:
+		return
+	}
+	// CloseListener が SYN-RECEIVED の接続を捨てるので、ここに来る接続のポートは待ち受け中
+	l := s.listeners[c.Key.Local.Port()]
+	if len(l.queue) >= maxAcceptQueue {
+		_ = c.Abort()
+		return
+	}
+	l.queue = append(l.queue, c)
+}
+
+// CloseListener は、port の待ち受けをやめる。以後の SYN には、閉じたポートとして RST を返す (RFC 9293 3.10.7.1)。
+// まだ Accept されていない接続 (accept キューの中のものと、SYN-RECEIVED のもの) は Abort で捨てる。
+// 残しておくと、誰も読まず、閉じもしない接続になる。Accept 済みの接続には触らない。
+// 接続が複数あるとき、RST を積む順番は決まっていない。
+func (s *Stack) CloseListener(port uint16) {
+	l := s.listeners[port]
+	if l == nil {
+		return
+	}
+	delete(s.listeners, port)
+	for _, c := range l.queue {
+		// キューの中で CLOSED になった接続は "connection does not exist" を返す。捨てるものがないだけ
+		_ = c.Abort()
+	}
+	for _, c := range s.conns {
+		if c.Key.Local.Port() == port && c.State == tcp.StateSynReceived {
+			_ = c.Abort()
+		}
+	}
 }
 
 // Handle は、受信セグメントを 1 つ処理する。送るパケットは送信キューに積み、戻り値では返さない。
@@ -457,7 +545,11 @@ func (s *Stack) Handle(ip ipv4.Header, t tcp.Header, payload []byte) {
 
 	// 既存の接続
 	if c, ok := s.conns[key]; ok {
+		synReceived := c.State == tcp.StateSynReceived
 		c.Handle(t, payload)
+		if synReceived {
+			s.enqueue(c)
+		}
 		s.reap(c)
 		return
 	}
@@ -478,7 +570,7 @@ func (s *Stack) reap(c *Connection) {
 
 // HandleTimeouts は、期限の来たタイマーを処理する。RFC 9293 3.10.8 (Timeouts)。
 // 呼ばれた時点の Now と期限を比べるので、呼ぶ間隔がタイマーの粒度になる。
-// main が一定の間隔で呼び、続けて TakeOutgoing で取り出して TUN に書く
+// tuntcp のループが一定の間隔で呼び、続けて TakeOutgoing で取り出してデバイスに書く
 // (いまあるタイマーは何も送らないが、M9 の再送タイマーは送る)。
 //
 // 時刻を Handle や HandleTimeouts の引数で渡さず、Now で引くのは、Close や Write のような
@@ -534,10 +626,10 @@ func (s *Stack) segmentArrivesNoConn(key connKey, ip ipv4.Header, t tcp.Header, 
 }
 
 // Read は、受信バッファに貯まったデータを p に移し、移したバイト数を返す。
-// 貯まっていなければ待たずに 0 を返す。
+// 貯まっていなければ待たずに 0 を返す。RFC 9293 3.10.3 RECEIVE Call に当たる。
 //
-// 仮の読み出し口。T6-7 のデモで main が呼ぶ。M8 で net.Conn の Read (データが来るまで
-// ブロックする) に置き換える。
+// 待つのは呼ぶ側 (tuntcp.Conn.Read) の役目。0 が返ったら、PeerClosed と Reset を見て、
+// これ以上届かないのか、まだ届くのかを区別する。
 func (c *Connection) Read(p []byte) int {
 	n, _ := c.rcvBuf.Read(p)
 	return n
@@ -548,27 +640,77 @@ func (c *Connection) Read(p []byte) int {
 // CLOSE-WAIT でも送れる (相手が送り終えただけで、こちらからの向きは開いている)。
 // 自分から閉じたあとの状態と、接続がないときはエラーを返す。
 //
-// 仮の書き込み口。T6-7 のデモで main が呼ぶ。M8 で net.Conn の Write に置き換える。
-// エラーの形 (net.OpError で包むかなど) は T8-5 で決める。
+// tuntcp.Conn.Write が呼ぶ。Accept が返すのは ESTABLISHED 以降の接続で、利用者が閉じたあとは呼ばないので、
+// いまエラーが返る場面はない。
 //
-// やっていないこと:
-//   - 送信バッファの上限と "insufficient resources" (未実装。M10)
-func (c *Connection) Write(p []byte) error {
+// 送信バッファの上限 (maxSendBuffer) までしか積まない。積めたバイト数を返す。0 のこともある。
+// 仕様は、積めないときに "error: insufficient resources" を返すとしているが、エラーにはせず、
+// 呼ぶ側 (tuntcp.Conn.Write) が ACK で空くのを待って、残りを書き直す。
+func (c *Connection) Write(p []byte) (int, error) {
 	switch c.State {
 	case tcp.StateSynReceived, tcp.StateEstablished, tcp.StateCloseWait:
-		c.sndBuf.Write(p)
+		n := min(len(p), maxSendBuffer-c.sndBuf.Len())
+		c.sndBuf.Write(p[:n])
 		c.output()
-		return nil
+		return n, nil
 	case tcp.StateFinWait1, tcp.StateFinWait2, tcp.StateClosing, tcp.StateLastAck, tcp.StateTimeWait:
 		// Close を呼んだあと。FIN より後ろにデータは送れない
-		return errConnClosing
+		return 0, errConnClosing
 	default:
-		return errConnNotExist
+		return 0, errConnNotExist
 	}
 }
 
+// maxSendBuffer は、送信バッファ (書かれたが ACK されていないデータ) の上限。
+// RFC にはない値で、docs/design.md の「対話で決めた仕様」の「net.Conn」で決めた。
+// 広告ウィンドウ (defaultWndSize) と同じ値にしただけで、ほかに根拠はない。
+const maxSendBuffer = 65535
+
+// PeerClosed は、相手の FIN を受け取ったかどうかを返す。接続が消えたあとも変わらない。
+// true なら、受信バッファにあるものが、相手から届くデータのすべて。
+// tuntcp.Conn の Read が、読み切ったあとに io.EOF を返すために見る。
+func (c *Connection) PeerClosed() bool {
+	return c.finReceived
+}
+
+// Reset は、相手の RST で接続が消えたかどうかを返す。自分が RST を送って捨てたとき (Abort) は false。
+// tuntcp.Conn の Read と Write が、ECONNRESET を返すために見る。
+func (c *Connection) Reset() bool {
+	return c.reset
+}
+
+// Release は、利用者が接続を手放すときに呼ぶ (net.Conn の Close)。読む向きも書く向きも、もう使わない。
+// RFC の CLOSE (Connection.Close) は送る向きだけを閉じ、そのあとも受け取れるので、別の口にしてある。
+// RFC 9293 3.6.1 MAY-1 の "half-duplex" な close に当たる。
+//
+// 読み残しがなければ、Close と同じく FIN を送って閉じる。
+// 読み残しがあれば、Abort で RST を送って捨てる (RFC 9293 3.6.1 SHLD-3: "If such a host issues a CLOSE call
+// while received data is still pending in the TCP connection ... its TCP implementation SHOULD send a RST
+// to show that data was lost")。手放したあとに届いた新しいデータに RST を返すのは、segmentArrives の Seventh。
+//
+// 呼ぶのは 1 回だけ (tuntcp.Conn.Close が守る)。接続がすでに消えていれば、何もしない。
+//
+// やっていないこと:
+//   - FIN-WAIT-2 で相手の FIN を待つ時間の上限 (意図して省いた。RFC にはなく、値の根拠がない。
+//     相手が FIN を送らなければ、接続は残り続ける)
+func (c *Connection) Release() {
+	switch c.State {
+	case tcp.StateEstablished, tcp.StateCloseWait:
+	default:
+		// 相手の RST などで、すでに消えている。Accept が返すのは ESTABLISHED 以降の接続で、
+		// 自分から閉じるのはこの呼び出しだけなので、ほかの状態では呼ばれない
+		return
+	}
+	if c.rcvBuf.Len() > 0 {
+		_ = c.Abort()
+		return
+	}
+	c.released = true
+	_ = c.Close()
+}
+
 // 利用者の呼び出しに返すエラー。文言は RFC 9293 3.10 の "error: ..." に合わせてある。
-// エラーの形 (net.OpError で包むかなど) は T8-5 で決める。
+// 利用者に見えるエラー (net.ErrClosed、ECONNRESET など) は、tuntcp の層が状態から決める。
 var (
 	errConnNotExist = errors.New("connection does not exist")
 	errConnClosing  = errors.New("connection closing")
@@ -591,7 +733,7 @@ var (
 //     あれば ESTABLISHED まで待つとしている。M8 の Accept は ESTABLISHED の接続だけを返すので、
 //     利用者が SYN-RECEIVED の接続を閉じる場面がない。エラーを返し、何も変えない)
 //
-// 仮の口。M8 で net.Conn の Close に置き換える。
+// 利用者が直接呼ぶ口はない。Release (net.Conn の Close) が、読み残しのないときに呼ぶ。
 func (c *Connection) Close() error {
 	switch c.State {
 	case tcp.StateEstablished:
@@ -673,8 +815,8 @@ func (c *Connection) output() {
 }
 
 // TakeOutgoing は、送信キューに積まれたパケットを積まれた順に返し、キューを空にする。
-// main が、受信セグメントを Handle に渡したあとと、Connection.Write を呼んだあとに呼び、
-// 返ったパケットを積まれた順に TUN に書く。
+// tuntcp のループが、入力 (受信セグメント、タイマー、API の呼び出し) を 1 つ処理するたびに呼び、
+// 返ったパケットを積まれた順にデバイスに書く。
 func (s *Stack) TakeOutgoing() [][]byte {
 	out := s.out
 	s.out = nil
@@ -694,10 +836,11 @@ func (s *Stack) TakeOutgoing() [][]byte {
 //   - RST を送ったあと TIME-WAIT に入る (3.5.2 の "The side of a connection issuing a reset should enter
 //     the TIME-WAIT state")。3.10.5 は "Delete the TCB, enter CLOSED state" としていて、節どうしで食い違う。
 //     イベントごとの手順を書いた 3.10.5 に従った (docs/design.md の「対話で決めた仕様」)
-//   - 待っている SEND と RECEIVE への "connection reset" の通知 (未実装。待つ呼び出しがまだない。T8-5)
 //
-// 仮の口。いまは main から呼ばれない。M8 で Listener の Close や、読み残しのある Close で使う。
-// 再送の上限に達したとき (T9-4) にも使う。
+// 待っている SEND と RECEIVE への通知は、tuntcp の層がやる。Abort を呼ぶのは、利用者が閉じたとき (Release)、
+// 待ち受けをやめたとき (CloseListener)、スタックを止めたとき (AbortAll)、accept キューが満杯のとき (enqueue) で、
+// どれも、待っている呼び出しは net.ErrClosed で返るか、そもそも無い。
+// 再送の上限に達したとき (T9-4) にも使う。そのときは、タイムアウトの通知が要る。
 func (c *Connection) Abort() error {
 	switch c.State {
 	case tcp.StateSynReceived, tcp.StateEstablished, tcp.StateFinWait1, tcp.StateFinWait2, tcp.StateCloseWait:
@@ -709,4 +852,15 @@ func (c *Connection) Abort() error {
 	c.State = tcp.StateClosed
 	c.stack.reap(c)
 	return nil
+}
+
+// AbortAll は、残っているすべての接続を Abort で捨てる (RFC 9293 3.10.5)。
+// スタックを止めるときに tuntcp.Stack.Close が呼び、続けて TakeOutgoing で RST を取り出して書く。
+// 相手に半端な接続を残さないため (docs/design.md の「対話で決めた仕様」の「API とパッケージの形」)。
+// 接続が複数あるとき、RST を積む順番は決まっていない。
+func (s *Stack) AbortAll() {
+	for _, c := range s.conns {
+		// テーブルにあるのは SYN-RECEIVED 以降の接続だけなので、Abort は "connection does not exist" を返さない
+		_ = c.Abort()
+	}
 }

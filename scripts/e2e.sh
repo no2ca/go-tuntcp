@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ビルド → 起動 → IP 割り当て → クライアント 2 本 (curl、つないで閉じるだけ) → 終了 までを 1 つのターミナルで行う。
+# ビルド → 起動 → IP 割り当て → クライアント 3 本 (curl、つないで閉じるだけ、404 になる curl) → 終了 までを 1 つのターミナルで行う。
 # 流れたパケットを tcpdump で、クライアントが終わったあとのソケットの状態を ss で記録し、tmp/e2e/ に残す。
 #
 # sudo は使わない。unshare で作ったユーザー名前空間とネットワーク名前空間の中で動かす。
@@ -91,10 +91,13 @@ record_ss() { # $1: 記録先
 }
 
 # --- 1 本目: curl。自作スタックがレスポンスのあとに先に閉じる ---
-# 受け取った本文は curl.txt、エラーは curl.err、終了コードは curl.exit に残す
+# 受け取った本文は curl.txt、ステータスは curl.status、エラーは curl.err、終了コードは curl.exit に残す。
+# Connection: close を付けると、net/http のサーバはレスポンスを返したあとに自分から接続を閉じる。
+# 付けないと、サーバは次のリクエストを待ち、curl が終わるときにカーネルが先に閉じる (2 本目と同じ向きになる)
 start_dump "$OUT/tcpdump.txt"
 curl_exit=0
-curl -sS -m 5 -o "$OUT/curl.txt" "$TUN_PEER_IP" 2>"$OUT/curl.err" || curl_exit=$?
+curl -sS -m 5 -H 'Connection: close' -o "$OUT/curl.txt" -w '%{http_code}\n' "$TUN_PEER_IP" \
+  >"$OUT/curl.status" 2>"$OUT/curl.err" || curl_exit=$?
 echo "$curl_exit" >"$OUT/curl.exit"
 record_ss "$OUT/ss.txt"
 stop_dump
@@ -108,11 +111,15 @@ echo "$client_exit" >"$OUT/client.exit"
 record_ss "$OUT/ss-close.txt"
 stop_dump
 
+# --- 3 本目: ハンドラのないパス。net/http が 404 を返す ---
+# 決まったバイト列を返しているのではなく、リクエストを解釈していることを確かめる。パケットは記録しない
+curl -sS -m 5 -o /dev/null -w '%{http_code}\n' "$TUN_PEER_IP/nope" >"$OUT/curl-404.status" 2>>"$OUT/curl.err" || true
+
 echo "--- 1 本目: tcpdump ($OUT/tcpdump.txt) ---"
 cat "$OUT/tcpdump.txt"
 echo "--- 1 本目: curl のあとの ss -tn ($OUT/ss.txt) ---"
 cat "$OUT/ss.txt"
-echo "--- 1 本目: curl (終了コード $curl_exit、本文 $OUT/curl.txt) ---"
+echo "--- 1 本目: curl (終了コード $curl_exit、ステータス $(cat "$OUT/curl.status")、本文 $OUT/curl.txt) ---"
 cat "$OUT/curl.txt" 2>/dev/null || true
 cat "$OUT/curl.err"
 echo "--- 2 本目: tcpdump ($OUT/tcpdump-close.txt) ---"
@@ -120,5 +127,6 @@ cat "$OUT/tcpdump-close.txt"
 echo "--- 2 本目: クライアントのあとの ss -tn ($OUT/ss-close.txt) ---"
 cat "$OUT/ss-close.txt"
 cat "$OUT/client.err"
+echo "--- 3 本目: /nope のステータス: $(cat "$OUT/curl-404.status") ---"
 
 ./scripts/e2e-check.sh "$OUT"

@@ -1,6 +1,6 @@
 # internal/stack
 
-受信した TCP セグメント、利用者の呼び出し（Write、Close、Abort）、タイマーの満了を受けて、接続の状態を進め、送るセグメントを作る。
+受信した TCP セグメント、利用者の呼び出し（Listen、Accept、Read、Write、Release など）、タイマーの満了を受けて、接続の状態を進め、送るセグメントを作る。
 全体の中での位置は [docs/design.md](../../docs/design.md) の「機能と実装の対応」の 8〜13 行目に当たる。
 
 このファイルは、中くらいの粒度の説明を置く。「どの状態で、何を受けたら、何をするか」を、仕様の段階とテストに結ぶ。1 つの分岐の理由は、コードのコメントに書いてある。分岐を足したり変えたりしたら、このファイルも直す。
@@ -90,7 +90,9 @@ FIN の番号は SEG.SEQ + データ長。Seventh でデータを受け取った
 ## 送信: `Write`、`Close` と `output`
 
 `Write` は送信バッファの後ろに積み、`Close` は状態を移して、どちらも `output` を呼ぶ。`output` は `Connection.Handle` の最後にも呼ばれる。
-送るものは `Stack` の送信キューに積み、`main` が `Stack.TakeOutgoing` で取り出して TUN に書く。
+送るものは `Stack` の送信キューに積み、`tuntcp` のループが `Stack.TakeOutgoing` で取り出してデバイスに書く。
+
+利用者（`tuntcp.Conn`）が閉じるときに呼ぶのは `Release`。読み残しがなければ `Close`、あれば `Abort` をする。`Release` のあとに RCV.NXT から始まるデータが届いたら、RST を送って CLOSED にする（RFC 9293 3.6.1 SHLD-3）。
 
 ```mermaid
 flowchart TD
@@ -132,7 +134,7 @@ flowchart TD
 
 ## タイマー: `Stack.HandleTimeouts`
 
-`main` が 1 秒おきに呼ぶ。`Stack.Now` で得た時刻と、接続ごとのタイマーの期限を比べる。いまあるタイマーは TIME-WAIT の 2MSL（4 分）だけ。期限が来たら CLOSED にしてテーブルから消す。何も送らない。
+`tuntcp` のループが 1 秒おきに呼ぶ。`Stack.Now` で得た時刻と、接続ごとのタイマーの期限を比べる。いまあるタイマーは TIME-WAIT の 2MSL（4 分）だけ。期限が来たら CLOSED にしてテーブルから消す。何も送らない。
 
 ## 状態の遷移
 
@@ -212,6 +214,7 @@ LISTEN は接続ごとの状態としては持たない。LISTEN 中のポート
 | Seventh | ESTABLISHED、FIN-WAIT-1、FIN-WAIT-2 | データがあり、SEG.SEQ が RCV.NXT と一致する | データを受信バッファに移し、RCV.NXT を SEG.LEN だけ進め、`<SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>` を返す | `TestHandle_Established_Data`、`TestHandle_ClientSeqWrapsAround`、`TestRead_*`、`TestHandle_FinWait_Data_Received`、`task e2e` | 済 |
 | Seventh | 同上 | データがあり、SEG.SEQ が RCV.NXT と一致しない | RCV.NXT は進めず、同じ形の ACK を返して捨てる。受信バッファにも入れない | `TestHandle_Established_UnexpectedSeq`、`TestRead_DiscardedDataNotDelivered` | 済（[design.md](../../docs/design.md) の「対話で決めた仕様」） |
 | Seventh | 同上 | データがない | 何も返さない | `TestHandle_Established_PureACK_NoReply` | 済 |
+| Seventh | ESTABLISHED、FIN-WAIT-1、FIN-WAIT-2 | `Release` のあとに、RCV.NXT から始まるデータが届いた | `<SEQ=SND.NXT><CTL=RST>` を送り、CLOSED にする（3.6.1 SHLD-3） | `TestRelease_DataArrivesAfterwards_SendsRST`、`TestRelease_NoNewData_NoRST`、`TestClose_DataArrivesAfterwards_StillReceived` | 済 |
 | Seventh | FIN 受信後 | データがある | 無視する。受け取らず、返信もしない | `TestHandle_CloseWait_DataIgnored`、`TestHandle_AfterPeerFIN_DataIgnored` | 済 |
 | Eighth | 同期済み | FIN があり、FIN の番号（SEG.SEQ + データ長）が RCV.NXT と一致する | RCV.NXT を 1 進め、データの分とまとめて 1 つの ACK を返す | `TestHandle_Established_FIN_EntersCloseWait`、`TestHandle_Established_DataAndFIN_OneACK`、`TestHandle_Established_DuplicateDataWithFIN_FINProcessed`、`TestHandle_Established_FIN_SeqWrapsAround`、`task e2e` | 済。利用者への通知は未（T8-5） |
 | Eighth | 同期済み | FIN があり、FIN の番号が RCV.NXT と一致しない | FIN を処理せず、いまの RCV.NXT を ACK で返す | `TestHandle_Established_FINNotAtRcvNxt_NotProcessed` | 済（[design.md](../../docs/design.md) の「対話で決めた仕様」） |
@@ -238,6 +241,15 @@ LISTEN は接続ごとの状態としては持たない。LISTEN 中のポート
 | SYN-RECEIVED | `Close` | エラーを返し、何も変えない | 3.10.4 | `TestClose_AlreadyClosing_ReturnsError` | 省略（[design.md](../../docs/design.md)） |
 | SYN-RECEIVED、ESTABLISHED、FIN-WAIT-1、FIN-WAIT-2、CLOSE-WAIT | `Abort` | `<SEQ=SND.NXT><CTL=RST>` を送り、CLOSED にする。未送信のデータは送らない | 3.10.5 | `TestAbort_SendsRST`、`TestAbort_UnsentData_OnlyRST` | 済。実機では確かめていない |
 | CLOSING、LAST-ACK、TIME-WAIT | `Abort` | 何も送らずに CLOSED にする | 3.10.5 | `TestAbort_AfterBothFINs_NoRST` | 済 |
+| ESTABLISHED、CLOSE-WAIT | `Write` で送信バッファが 65535 バイトを越える | 入る分だけ積み、積めたバイト数を返す | [design.md](../../docs/design.md) の「net.Conn」 | `TestWrite_SendBufferLimit`、`TestWrite_SendBufferFreedByACK` | 済 |
+| ESTABLISHED、CLOSE-WAIT | `Release`、読み残しなし | `Close` と同じ（FIN を送る） | 3.6.1 MAY-1、3.10.4 | `TestRelease_NoUnreadData_SendsFIN`、`TestRelease_AllDataRead_SendsFIN` | 済 |
+| ESTABLISHED、CLOSE-WAIT | `Release`、読み残しあり | `Abort` と同じ（RST を送る） | 3.6.1 SHLD-3 | `TestRelease_UnreadData_SendsRST` | 済。CLOSE-WAIT はテストなし |
+| CLOSED | `Release` | 何もしない | — | `TestRelease_Closed_DoesNothing` | 済 |
+| 待ち受け | `Stack.Listen` | ポートを LISTEN にする。すでに待ち受けていれば `ErrPortInUse` | 3.10.1、[design.md](../../docs/design.md) の「accept キュー」 | `TestListen_SamePortTwice_ReturnsError` | 済 |
+| SYN-RECEIVED から先へ進んだ接続 | （`Stack.Handle` の中） | accept キューに入れる。128 本で満杯なら `Abort` | design.md の「accept キュー」 | `TestAccept_*` | 済 |
+| 待ち受け | `Stack.Accept` | キューの先頭を取り出す。なければ nil | 同上 | `TestAccept_*` | 済 |
+| 待ち受け | `Stack.CloseListener` | LISTEN をやめ、SYN-RECEIVED とキューの中の接続を `Abort` する | 同上 | `TestCloseListener_*` | 済 |
+| すべての接続 | `Stack.AbortAll` | 接続ごとに `Abort` をする。スタックを止めるとき（`tuntcp.Stack.Close`）に呼ぶ | 3.10.5、[design.md](../../docs/design.md) の「API とパッケージの形」 | `TestAbortAll_*` | 済 |
 | CLOSED | `Close`、`Abort` | "connection does not exist" を返す | 3.10.4、3.10.5 | `TestClose_AlreadyClosing_ReturnsError`、`TestAbort_Closed_ReturnsError` | 済 |
 
 ### タイマー（`Stack.HandleTimeouts`）

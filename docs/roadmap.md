@@ -29,14 +29,14 @@ TUN デバイスの上に TCP プロトコルスタックを実装するまで�
 
 deadline を範囲に入れるのは、`net/http` が使うため。`http.Server` はブロック中の `Read` を中断するのに `SetReadDeadline` を過去の時刻で呼ぶ（Go の `net/http/server.go` の `abortPendingRead`）。何もしない実装では、接続の後始末で止まる。
 
-## 現在の状態（2026-11-13）
+## 現在の状態（2026-11-16）
 
-- M0〜7（実機確認の自動化、TUN、IPv4、TCP ヘッダ、handshake、データの送受信、切断）は完了。次は T8-1（API とパッケージの形を、人間が決める）
-- `curl` が仮のデモ（`cmd/tuntcp` の `demoServer`）から固定の HTTP レスポンスを受け取り、終了コード 0 で終わる。デモはレスポンスのあとに閉じ、`ss -tn` に接続が残らない
-- 再送はまだない（M9）。FIN や ACK が落ちると、切断が途中で止まる
-- `task test` はすべて通る
-- `task e2e` は sudo なしで動き、handshake、データへの ACK、レスポンスへの ACK、`curl` が受け取った本文と終了コード、両方の向きの切断、`ss -tn` に接続が残らないことを検証して終了コードで返す
-- M7 で AI が決めた仕様が、人間の確認待ち（[design.md](design.md) の「対話で決めた仕様」の「切断と時計」）。M7 の抜き取りと予想の確認も、人間の番
+- M0〜8（実機確認の自動化、TUN、IPv4、TCP ヘッダ、handshake、データの送受信、切断、Socket API）は完了。次は T9-1（再送キュー）
+- 公開パッケージ `tuntcp`（リポジトリの直下）の `Listener` と `Conn` が `net.Listener` と `net.Conn` を満たし、`cmd/tuntcp` は `http.Serve` をその上で動かしている。目標の条件 1 は `task e2e` で確かめている
+- 再送はまだない（M9）。パケットが落ちると、転送も切断も途中で止まる
+- `task test`、`go vet ./...`、`go test -race ./...` はすべて通る
+- `task e2e` は sudo なしで動き、handshake、データへの ACK、`http.Serve` のステータス（200 と 404）と本文、`curl` の終了コード、両方の向きの切断、`ss -tn` に接続が残らないことを検証して終了コードで返す
+- 人間の番: M8 で AI が足した仕様の確認（[design.md](design.md) の「net.Conn」と「accept キュー」の「AI が足したもの」）、M7 と M8 の抜き取りと予想の確認（行は [verification-log.md](verification-log.md) に示してある）
 
 ## 完了したマイルストーン
 
@@ -59,7 +59,7 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
   - 送信: `Connection.Write`（仮の口）で送信バッファに積み、SND.NXT から相手のウィンドウと MSS 536 に収まる分を切り出して送る。送るパケットは `Stack.TakeOutgoing` の送信キューから出す
   - ESTABLISHED での ACK（Fifth）: SND.UNA を進めて送信バッファから捨て、SND.WL1 / SND.WL2 の条件で送信ウィンドウを更新する
   - `task e2e` が、`curl` の受け取った本文と、レスポンスへの ACK を検証する
-  - AI が決めた仕様のうち、仮の読み書き口は [design.md](design.md) の「対話で決めた仕様」にあり、人間の確認待ち。送信キューの形は T7-0 で人間が決め直した
+  - AI が決めた仕様のうち、仮の読み書き口は [design.md](design.md) の「対話で決めた仕様」にあり、2026-11-14 に人間が承認した。送信キューの形は T7-0 で人間が決め直した
   - 後回しにしたもの: 受信バッファと送信バッファの上限、広告ウィンドウを空きから決めること（M10）、ACK を遅らせてデータに相乗りさせること（決めていない）
 
 - [x] **M7** 切断（T7-0〜T7-7）
@@ -83,7 +83,7 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
     - FIN を送る: ESTABLISHED → FIN-WAIT-1、CLOSE-WAIT → LAST-ACK
     - 自分の FIN への ACK を受けたときの遷移: FIN-WAIT-1 → FIN-WAIT-2、CLOSING → TIME-WAIT、LAST-ACK → CLOSED
     - FIN-WAIT-1 と FIN-WAIT-2 で受けるデータと FIN（T7-3 の残り）、各状態での RST もここで実装した
-    - AI が決めた仕様（FIN を別のセグメントで送る、FIN にもウィンドウの空きを求める、など）は [design.md](design.md) の「対話で決めた仕様」にあり、人間の確認待ち
+    - AI が決めた仕様（FIN を別のセグメントで送る、FIN にもウィンドウの空きを求める、など）は [design.md](design.md) の「対話で決めた仕様」にあり、2026-11-14 に人間が承認した
   - [x] **T7-5** TIME-WAIT の 2MSL タイマー
     - MSL は RFC 9293 3.4.2 の 2 分。TIME-WAIT に入ってから 4 分で接続を消す。相手の FIN の再送を受けたら数え直す
   - [x] **T7-6** 異常時に RST を送って接続を捨てる（Abort）
@@ -94,36 +94,45 @@ deadline を範囲に入れるのは、`net/http` が使うため。`http.Server
 
 ---
 
-## M8: Socket API（サーバ側）
+## M8: Socket API（サーバ側）（完了）
 
 再送とフロー制御より先に API を入れる。送受信バッファを、並行処理の形が決まってから仕上げるため。
 
 完了条件: `task e2e` で、`http.Serve` に渡した自作の `net.Listener` に `curl` が成功する。`go test -race ./...` が通る
 
-- [ ] **T8-1** API とパッケージの形を決める
+- [x] **T8-1** API とパッケージの形を決める
   - 公開するパッケージの名前と置き場所、型の名前、`Stack` の起動と停止の方法。案と理由を示して、人間が決める
-- [ ] **T8-2** イベントループ
+  - 決めた内容は [design.md](design.md) の「対話で決めた仕様」の「API とパッケージの形」にある
+- [x] **T8-2** イベントループ
   - `Stack` を 1 つの goroutine が持ち、受信セグメント、タイマー、API の呼び出しをチャネルで受ける（[design.md](design.md) の「これから変えるところ」の 3）
-- [ ] **T8-3** `net.Listener`: `Accept` / `Close` / `Addr`
+  - `tuntcp.New` / `Listen` / `Close` と、止めるときにすべての接続を捨てる `stack.Stack.AbortAll` を入れた。`Listen` が返す `Listener` は、まだメソッドを持たない
+  - ループがタイマーを処理することは、T8-4 のあとで `TestStack_TimeWaitExpires` が確かめるようになった
+  - `tun.Create` が返す `*os.File` は、`Close` しても待っている `Read` が返らなかった。T8-8 で直した
+- [x] **T8-3** `net.Listener`: `Accept` / `Close` / `Addr`
   - ESTABLISHED になった接続を accept キューに積む。キューの上限と、溢れたときの扱いを決める
   - `Close` したら、ブロック中の `Accept` は `net.ErrClosed` で返る
-- [ ] **T8-4** `net.Conn`: `Read` / `Write` / `Close` / `LocalAddr` / `RemoteAddr`
+  - 決めた内容は [design.md](design.md) の「対話で決めた仕様」の「accept キュー」にある。AI が足した 3 点は、人間の確認待ち
+- [x] **T8-4** `net.Conn`: `Read` / `Write` / `Close` / `LocalAddr` / `RemoteAddr`
   - `Read` はデータが来るまでブロックする。`Write` は送信バッファに空きができるまでブロックする
   - `Close` は送信バッファの残りを送ってから FIN を送る。呼び出し自体は待たずに返る
   - `net.Conn` の `Close` は読む向きも閉じる。M7 の `Connection.Close` は RFC の CLOSE（送る向きだけ）なので、読み残しがあるときや、Close のあとにデータが届いたときの扱いを決める（RFC 9293 3.6.1 SHLD-3 は RST を送るとしている。`Connection.Abort` が使える）
-- [ ] **T8-5** エラーの約束
+  - 決めた内容は [design.md](design.md) の「対話で決めた仕様」の「net.Conn」にある。SHLD-3 のとおり RST を送る（`stack.Connection.Release`）
+- [x] **T8-5** エラーの約束
   - 相手の FIN を受け、受信バッファを読み切ったら `Read` は `io.EOF`
   - 相手の RST を受けたら、`Read` と `Write` は `syscall.ECONNRESET` を包んだエラー
   - `Close` のあとの呼び出しと、`Close` で中断された呼び出しは `net.ErrClosed`
   - エラーは標準の `net` と同じく `*net.OpError` で包む
-- [ ] **T8-6** deadline: `SetDeadline` / `SetReadDeadline` / `SetWriteDeadline`
+- [x] **T8-6** deadline: `SetDeadline` / `SetReadDeadline` / `SetWriteDeadline`
   - 期限が来たら、ブロック中の呼び出しも `os.ErrDeadlineExceeded` で返る。エラーは `net.Error` を満たし、`Timeout()` が true を返す
   - 過去の時刻を渡すと、ブロック中の呼び出しがすぐ返る。ゼロ値を渡すと期限がなくなる
-- [ ] **T8-7** 並行呼び出し
+- [x] **T8-7** 並行呼び出し
   - 複数の goroutine から `Read`、`Write`、`Close`、deadline の設定を同時に呼べる。`-race` を付けたテストで確かめる
-- [ ] **T8-8** `net/http` のサーバを載せる
+  - T8-4〜T8-7 は、`Conn` のメソッドが互いに絡むので、テストのコミット 1 つと実装のコミット 1 つにまとめた
+- [x] **T8-8** `net/http` のサーバを載せる
   - 仮のデモを捨て、`cmd/` の下のサンプルを `http.Serve` に置き換える
   - `task e2e` の検証を、`http.Serve` が返すステータスと本文に合わせる
+  - 1 本目の `curl` に `Connection: close` を付け、自作スタックが先に閉じる向きを保った。ハンドラのないパスに 404 が返ることも見る（決まったバイト列を返しているのではないことの確認）
+  - `tun.Create` を、ノンブロッキングで開く形に直した。前の形では、`Close` しても待っている `Read` が返らなかった（名前空間の中で確かめた）
 
 ## M9: 再送
 

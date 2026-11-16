@@ -300,7 +300,7 @@ func TestWrite_CloseWait_SendsData(t *testing.T) {
 	s := newTestStack()
 	c := toCloseWait(t, s)
 
-	if err := c.Write([]byte("hello")); err != nil {
+	if _, err := c.Write([]byte("hello")); err != nil {
 		t.Fatalf("Write in CLOSE-WAIT: %v", err)
 	}
 
@@ -324,7 +324,7 @@ func TestHandle_CloseWait_ACK_SendsRemainingData(t *testing.T) {
 	s.Handle(incomingIP(), fin, nil)
 	takeSent(t, s) // FIN への ACK
 	mustState(t, c, tcp.StateCloseWait)
-	if err := c.Write([]byte("hello world")); err != nil {
+	if _, err := c.Write([]byte("hello world")); err != nil {
 		t.Fatalf("Write in CLOSE-WAIT: %v", err)
 	}
 	if segs := takeSent(t, s); len(segs) != 1 || string(segs[0].payload) != "hello" {
@@ -607,7 +607,7 @@ func TestWrite_AfterClose_ReturnsError(t *testing.T) {
 			s := newTestStack()
 			c := tt.setup(t, s)
 
-			if err := c.Write([]byte("hello")); !errors.Is(err, errConnClosing) {
+			if _, err := c.Write([]byte("hello")); !errors.Is(err, errConnClosing) {
 				t.Errorf("Write: err = %v, want %v", err, errConnClosing)
 			}
 			if segs := takeSent(t, s); len(segs) != 0 {
@@ -1269,7 +1269,7 @@ func TestAbort_Closed_ReturnsError(t *testing.T) {
 	if err := c.Abort(); !errors.Is(err, errConnNotExist) {
 		t.Errorf("second Abort: err = %v, want %v", err, errConnNotExist)
 	}
-	if err := c.Write([]byte("hello")); !errors.Is(err, errConnNotExist) {
+	if _, err := c.Write([]byte("hello")); !errors.Is(err, errConnNotExist) {
 		t.Errorf("Write after Abort: err = %v, want %v", err, errConnNotExist)
 	}
 	if err := c.Close(); !errors.Is(err, errConnNotExist) {
@@ -1277,5 +1277,34 @@ func TestAbort_Closed_ReturnsError(t *testing.T) {
 	}
 	if segs := takeSent(t, s); len(segs) != 0 {
 		t.Errorf("sent %d segments on a closed connection, want 0", len(segs))
+	}
+}
+
+func TestAbortAll_SendsRSTAndEmptiesTable(t *testing.T) {
+	// スタックを止めるとき (tuntcp.Stack.Close) に呼ぶ。残っている接続のそれぞれに 3.10.5 の Abort をする。
+	// ESTABLISHED の接続には <SEQ=SND.NXT><CTL=RST> を送り、テーブルから消す
+	s := newTestStack()
+	c := establish(t, s)
+
+	s.AbortAll()
+
+	segs := takeSent(t, s)
+	if len(segs) != 1 {
+		t.Fatalf("sent %d segments, want 1 (RST)", len(segs))
+	}
+	checkSegment(t, segs[0].hdr, tcp.FlagRST, testISS+1, 0)
+	checkState(t, c, tcp.StateClosed)
+	if len(s.conns) != 0 {
+		t.Errorf("%d connections left in the table, want 0", len(s.conns))
+	}
+}
+
+func TestAbortAll_NoConnections_SendsNothing(t *testing.T) {
+	s := newTestStack()
+
+	s.AbortAll()
+
+	if segs := takeSent(t, s); len(segs) != 0 {
+		t.Errorf("sent %d segments, want 0", len(segs))
 	}
 }
