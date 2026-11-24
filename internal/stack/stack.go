@@ -264,7 +264,7 @@ func (c *Connection) segmentArrives(t tcp.Header, payload []byte) []byte {
 		// ESTABLISHED になるのを防ぐ。範囲の外なら <SEQ=SEG.ACK><CTL=RST> を返し、
 		// 状態は変えない (正しい ACK があとから届けば確立できる)。
 		// SYN-RECEIVED では SND.UNA = ISS、SND.NXT = ISS+1 なので、通るのは SEG.ACK = ISS+1 だけ
-		if !(tcp.SeqLT(c.Snd.UNA, t.Ack) && tcp.SeqLE(t.Ack, c.Snd.NXT)) {
+		if !tcp.AckAcceptable(c.Snd.UNA, t.Ack, c.Snd.NXT) {
 			return buildSegment(c.Key.Local, c.Key.Remote, tcp.FlagRST, t.Ack, 0, c.Rcv.WND, nil)
 		}
 		c.State = tcp.StateEstablished

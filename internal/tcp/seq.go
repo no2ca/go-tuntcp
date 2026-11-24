@@ -31,3 +31,7 @@ func SegmentAcceptable(seq, segLen, rcvNXT uint32, rcvWND uint16) bool {
 		return inWindow(seq) || inWindow(seq+segLen-1)
 	}
 }
+
+func AckAcceptable(una, ack, nxt uint32) bool {
+	return SeqLT(una, ack) && SeqLE(ack, nxt)
+}
